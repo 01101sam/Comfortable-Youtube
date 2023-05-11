@@ -5,10 +5,11 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.1.0
+// @version      1.2.0
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
-// @include      https://*.youtube.com/*
+// @match        https://youtube.com/*
+// @match        https://www.youtube.com/*
 // @exclude      https://studio.youtube.com/*
 // @run-at       document-start
 // @grant        GM_setValue
@@ -117,7 +118,7 @@
       if (!handleXMLRequest(method, url)) {
         return;
       }
-      // console.debug("XMLHttpRequest", method, url);
+      // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
       this.onreadystatechange = function () {
         const resposneText = handleXMLResponse(this.readyState, this);
         if (resposneText) {
@@ -134,7 +135,7 @@
       xmlReqFunc.apply(this, arguments);
     };
     wind.fetch = async function (url, init) {
-        // console.debug("fetch", url, init);
+        console.debug("[Comfortable YT] fetch", url, init);
         try {
             return !handleFetchRequest(url, init) ? new Response() : await fetchReqFunc.apply(this, arguments);
         } catch (e) {
@@ -150,7 +151,7 @@
 
   // Handle xml request
   function handleXMLRequest(method, url) {
-    if (url.startsWith("/youtubei/v1/log_event")) return;
+    if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
     try {
       const parsedUrl = new URL(url);
       if (GM_getValue("audio-mode")) {
@@ -174,6 +175,7 @@
       try {
           const url = new URL(self.responseURL);
           let jsonResp;
+          // console.debug("[Comfortable YT] URL Path: ", url.pathname);
           switch (url.pathname) {
               case "/youtubei/v1/player":
                   jsonResp = JSON.parse(self.responseText);
@@ -183,14 +185,16 @@
                   // console.debug(url.pathname);
                   break;
           }
-      } catch {}
+      } catch (e) {
+          console.error("[Comfortable YT] Error: ", e);
+      }
     }
   }
 
   // Handle fetch request
   function handleFetchRequest(url, init) {
     if (url instanceof Request) url = url.url;
-    if (url.startsWith("/youtubei/v1/log_event")) return;
+    if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
@@ -206,7 +210,7 @@
         }
       }
     } catch (e) {
-        console.error(e);
+        console.error("[Comfortable YT] Error: ", e);
     }
     return true;
   }
@@ -237,7 +241,7 @@
       statusText: data.statusText,
       headers: data.headers,
     });
-    ["ok", "redirected", "type", "url"].forEach((items) => {
+    ["ok", "redirected", "type", "url"].forEach(items => {
       Object.defineProperty(response, items, { value: data[items] });
     });
     return response;
@@ -271,7 +275,7 @@
   // Remove tracking
   function removeTracking(json) {
     if (json.playbackTracking) {
-      ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach((urlName) => {
+      ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
         delete json.playbackTracking[urlName];
       });
       console.debug("Youtube tracking removed.");
@@ -281,14 +285,13 @@
   // Modify player
   function handlePlayer(playerJson) {
     const liveBroadcastDetails =
-      playerJson.microformat.playerMicroformatRenderer.liveBroadcastDetails;
-    if (liveBroadcastDetails && liveBroadcastDetails.isLiveNow) {
+      playerJson.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
+    if (liveBroadcastDetails && liveBroadcastDetails?.isLiveNow) {
       isLive = true;
     }
     removeAds(playerJson);
     removeYouThere(playerJson);
     removeTracking(playerJson);
-    // console.debug(playerJson);
   }
 
   // Hook ytInitialPlayerResponse before page is fully loaded
