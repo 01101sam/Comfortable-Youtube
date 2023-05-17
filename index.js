@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.3.0
+// @version      1.3.1
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -55,6 +55,9 @@ function removeYouThere(json) {
 // Remove tracking
 function removeTracking(json) {
   if (json.playbackTracking) {
+    ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
+      delete json.playbackTracking[urlName];
+    });
     delete json.playbackTracking;
     console.debug("Youtube tracking removed.");
   }
