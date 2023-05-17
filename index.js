@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.2.1
+// @version      1.3.0
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -16,41 +16,67 @@
 // @grant        GM_getValue
 // ==/UserScript==
 
+// Utils
+function getTime() {
+  // Get the current time in seconds
+  const now = Date.now() / 1000,
+    // Extract the integer part (seconds since Unix epoch)
+    seconds = Math.floor(now);
+  return {
+    seconds: seconds.toString(),
+    // and fractional part (simulate nanoseconds)
+    nanos: Math.floor((now - seconds) * 1e9)
+  };
+}
+
 
 // region Player JSON
 
 // Remove Ads
 function removeAds(json) {
-  if (json.adPlacements) {
-    console.debug("adPlacements removed.");
-    delete json.adPlacements;
-  }
-  if (json.playerAds) {
-    console.debug("playersAds removed.");
-    delete json.playerAds;
+  for (const key of ["adPlacements", "playerAds"]) {
+    if (json[key]) {
+      console.debug(`Video ${key} removed.`);
+      delete json[key];
+    }
   }
 }
 
-// Remove "Are you there? (youThere)" Asking
+// Remove "Are you there? (youThere)" Prompt
 function removeYouThere(json) {
-  if (json.messages) {
-    for (const [k, v] of Object.entries(json.messages)) {
-      if ("youThereRenderer" in v) {
+  if (json.messages)
+    json.messages = json.messages.filter(message => {
+      if ("youThereRenderer" in message)
         console.debug('"Are you there (youThere)" asking removed.');
-        json.messages.splice(k, 1);
-        break;
-      }
-    }
-  }
+      return !("youThereRenderer" in message);
+    });
 }
 
 // Remove tracking
 function removeTracking(json) {
   if (json.playbackTracking) {
-    ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
-      delete json.playbackTracking[urlName];
-    });
+    delete json.playbackTracking;
     console.debug("Youtube tracking removed.");
+  }
+}
+
+// Restore download feature
+function restoreDownload(json) {
+  if (json.frameworkUpdates.entityBatchUpdate?.mutations) {
+    const payload = json.frameworkUpdates.entityBatchUpdate.mutations[0].payload;
+    if (payload.offlineabilityEntity && payload.offlineabilityEntity.addToOfflineButtonState !== "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED") {
+      const entityKey = payload.offlineabilityEntity.key;
+      payload.offlineabilityEntity = {
+        addToOfflineButtonState: "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED",
+        contentCheckOk: false,
+        key: entityKey,
+        racyCheckOk: false,
+        offlineabilityRenderer: "CAEaGQoVChMKEeWFqOmrmOa4hSAoMTA4MHApGAcaEgoOCgwKCumrmCAoNzIwcCkYAhoSCg4KDAoK5LitICgzNjBwKRgBGhIKDgoMCgrkvY4gKDE0NHApGAQiDTILb2ZmbGluZWxpc3Q="
+      }
+      if (!json.playabilityStatus.offlineability)
+        json.playabilityStatus.offlineability = { "offlineabilityRenderer": { "offlineable": true } }
+      console.debug("Download feature restored.");
+    }
   }
 }
 
@@ -64,6 +90,7 @@ function handlePlayer(playerJson) {
   removeAds(playerJson);
   removeYouThere(playerJson);
   removeTracking(playerJson);
+  restoreDownload(playerJson);
 }
 
 // endregion
@@ -81,38 +108,40 @@ function removePromoOverlay(json) {
 // Remove home page banner promotion
 function removeHeaderMasterThreadPromo(json) {
   if (json.contents?.twoColumnBrowseResultsRenderer?.tabs) {
-    for (const [key, tab] of Object.entries(json.contents.twoColumnBrowseResultsRenderer.tabs)) {
-      if (
-        tab.tabRenderer?.selected &&
-        tab.tabRenderer?.content?.richGridRenderer?.masthead
-      ) {
-        const masterThread = tab.tabRenderer.content.richGridRenderer.masthead;
-        if (masterThread.bannerPromoRenderer) {
-          delete masterThread.bannerPromoRenderer;
-          console.debug("Header master thread promo removed.");
-        }
-        break;
-      }
+    const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content.richGridRenderer)?.tabRenderer?.content;
+    if (tab)
+      tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(content => {
+        if (content.richItemRenderer?.content?.adSlotRenderer)
+          console.debug("Video slot AD removed.");
+        return !content.richItemRenderer?.content?.adSlotRenderer;
+      });
+    if (
+      tab &&
+      tab.richGridRenderer.masthead &&
+      tab.richGridRenderer.masthead.bannerPromoRenderer
+    ) {
+      delete tab.richGridRenderer.masthead;
+      console.debug("Removed home page banner promotion.");
     }
   }
 }
 
 // Modify browse
 function handleBrowse(browseJson) {
-  removeHeaderMasterThreadPromo(browseJson);
   removePromoOverlay(browseJson);
+  removeHeaderMasterThreadPromo(browseJson);
 }
 
 // endregion
 
 function removeNextWatchColAd(json) {
   if (json.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results) {
-    for (const [key, result] of Object.entries(json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults.results)) {
-      if (result.adSlotRenderer) {
-        json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults.results.splice(key, 1);
-        console.debug(`Next watch col ${key} AD removed.`);
-      }
-    }
+    const secondaryResults = json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults, results = secondaryResults.results;
+    const { itemSectionRenderer } = results.find(result => result.itemSectionRenderer);
+    itemSectionRenderer.contents = itemSectionRenderer.contents.filter(content => {
+      if (content.adSlotRenderer) console.debug("Next watch column AD removed.");
+      return !content.adSlotRenderer;
+    });
   }
 }
 
@@ -124,7 +153,209 @@ function handleNext(nextJson) {
 
 // endregion
 
-(function (xmlReqFunc, fetchReqFunc) {
+// region Download handling
+
+// Handle download action
+function handleDownloadAction(requestJson, json) {
+  const videoId = requestJson["videoId"],
+    formatType = requestJson["preferredFormatType"],
+    entityKey = btoa(atob("EgsAAAAAAAAAAAAAACDKASgB").replace("\x00".repeat(11), videoId));
+  // debugger;
+  if (json.onResponseReceivedCommand.openPopupAction?.popup?.offlinePromoRenderer) {  // Not premium
+    const clickTrackingParams = json.onResponseReceivedCommand.clickTrackingParams;
+    const commandOne = requestJson.preferredFormatType === "UNKNOWN_FORMAT_TYPE" ? {
+      clickTrackingParams,
+      openPopupAction: {
+        popupType: "DIALOG",
+        replacePopup: true,
+        popup: {
+          downloadQualitySelectorRenderer: {
+            trackingParams: clickTrackingParams,
+            downloadQualityPickerEntityKey: entityKey,
+            premiumIcon: { "iconType": "SAD" },
+            premiumDescription: { runs: [{ text: "You are not YouTube Premium" }] },
+            onSubmitEndpoint: {
+              clickTrackingParams,
+              offlineVideoEndpoint: {
+                action: "ACTION_ADD",
+                videoId,
+                actionParams: {
+                  formatType,
+                  settingsAction: "DOWNLOAD_QUALITY_SETTINGS_ACTION_SAVE"
+                }
+              }
+            }
+          }
+        }
+      }
+    } : {
+      clickTrackingParams,
+      offlineVideoEndpoint: {
+        videoId,
+        action: "ACTION_ADD",
+        actionParams: {
+          "formatType": formatType,
+          "settingsAction": "DOWNLOAD_QUALITY_SETTINGS_ACTION_ALREADY_SAVED"
+        }
+      }
+    };
+    if (requestJson.preferredFormatType === "UNKNOWN_FORMAT_TYPE") {  // Next, frameworkUpdates
+      json.frameworkUpdates = {
+        entityBatchUpdate: {
+          timestamp: getTime(),
+          mutations: [{
+            entityKey,
+            type: "ENTITY_MUTATION_TYPE_REPLACE",
+            payload: {
+              downloadQualityPickerEntity: {
+                "key": entityKey,
+                "formats": [
+                  { "name": "HD (1080p)", "format": "HD_1080" },
+                  { "name": "HD (720p)", "format": "HD" },
+                  { "name": "SD (480p)", "format": "SD" },
+                  { "name": "LD (144p)", "format": "LD" },
+                  {
+                    "name": "Use this feature at your risk!",
+                    "availabilityType": "OFFLINEABILITY_AVAILABILITY_TYPE_PREMIUM_LOCKED",
+                    "format": "UNKNOWN_FORMAT_TYPE"
+                  }
+                ]
+              }
+            }
+          }]
+        }
+      }
+    }
+    json.onResponseReceivedCommand = {
+      clickTrackingParams,
+      commandExecutorCommand: {
+        "commands": [
+          commandOne,
+          {
+            clickTrackingParams,
+            signalAction: {
+              signal: "REQUEST_PERSISTENT_STORAGE"
+            }
+          }
+        ]
+      }
+    }
+    console.debug("Replaced download action from normal user to Premium.");
+  }
+}
+
+// Handle Playback data entity
+function handlePlaybackDataEntity(url, requestJson, json) {
+  function toTransferKey(str) {
+    // Step 1: URL decode
+    const urlDecoded = decodeURIComponent(str);
+
+    // Step 2: Base64 decode
+    const base64Decoded = atob(urlDecoded);
+
+    // Step 3: Convert to byte array
+    const byteArray = new Uint8Array([...base64Decoded].map(c => c.charCodeAt(0)));
+
+    // Step 4: Change the last third byte
+    byteArray[14]++;
+
+    // Step 5: Convert back to string
+    const modifiedString = String.fromCharCode.apply(null, byteArray);
+
+    // Step 6: Base64 encode
+    const base64Encoded = btoa(modifiedString);
+
+    // Step 7: URL encode
+    return encodeURIComponent(base64Encoded);
+  }
+
+  const mutations = json.frameworkUpdates.entityBatchUpdate.mutations;
+
+  // Only for download failed mode
+  // if (mutations[0].payload.offlineVideoPolicy.action !== "OFFLINE_VIDEO_POLICY_ACTION_DOWNLOAD_FAILED")
+  //   return;
+
+  const entityKey = requestJson["videos"][0]["entityKey"],
+    transferEntityKey = toTransferKey(entityKey),
+    requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url),
+    lastUpdatedTimestampSeconds = Number(mutations[0].payload.offlineVideoPolicy.lastUpdatedTimestampSeconds);
+  requestUrl.pathname = "/youtubei/v1/player";
+
+
+  // Fetch playerResponseJson
+  let playerResponseJson;
+  try {
+    console.debug("[Comfortable YT]", "Download:", "Fetching player response");
+    const xhr = window.unsafeWindow.XMLHttpRequest();
+    xhr.open("POST", requestUrl.toString(), false);
+    xhr.send(JSON.stringify({
+      context: requestJson.context,
+      videoId: atob(decodeURIComponent(entityKey)).substring(2, 13)
+    }));
+    if (xhr.status !== 200) throw new Error(`Player response status is ${xhr.status}`);
+    else if (!xhr.responseText) throw new Error("Player response is empty");
+    playerResponseJson = JSON.parse(xhr.responseText);
+    if (playerResponseJson.playabilityStatus?.status !== "OK") {
+      console.error("[Comfortable YT]", "Video download failed:", `Player response status is ${playerResponseJson.playabilityStatus?.status}`);
+      return;
+    }
+  } catch (e) {
+    console.error("[Comfortable YT]", "Video download failed:", "Failed to fetch player response:", e);
+    return;
+  }
+
+  // Edit offlineVideoPolicy
+  Object.assign(mutations[0].payload.offlineVideoPolicy, {
+    action: "OFFLINE_VIDEO_POLICY_ACTION_OK",
+    shortMessageForDisabledAction: undefined,
+    expirationTimestamp: lastUpdatedTimestampSeconds + (1 * 60 * 60 * 24 * 365),  // 1 Year
+  });
+
+  // // Edit playbackData
+  Object.assign(mutations[1].payload.playbackData, {
+    transfer: transferEntityKey,
+    streamDownloadTimestampSeconds: mutations[1].payload.playbackData.playerResponseTimestamp,
+    playerResponseJson: JSON.stringify({
+      responseContext: playerResponseJson.responseContext,
+      attestation: playerResponseJson.attestation,
+      microformat: playerResponseJson.microformat,
+      offlineState: {
+        action: "OK",
+        expiresInSeconds: 10,  // 1 Year
+        isOfflineSharingAllowed: true,
+        refreshInSeconds: 37355,  // 37355
+      },
+      playabilityStatus: playerResponseJson.playabilityStatus,
+      playbackTracking: playerResponseJson.playbackTracking,
+      playerConfig: playerResponseJson.playerConfig,
+      storyboards: playerResponseJson.storyboards,
+      streamingData: playerResponseJson.streamingData,
+      videoDetails: playerResponseJson.videoDetails,
+      trackingParams: playerResponseJson.trackingParams
+    })
+  });
+
+  // Add orchestrationActions
+  Object.assign(json, {
+    orchestrationActions: [{
+      entityKey: transferEntityKey,
+      actionType: "OFFLINE_ORCHESTRATION_ACTION_TYPE_ADD",
+      actionMetadata: {
+        priority: 1,
+        transferEntityActionMetadata: requestJson["videos"][0].downloadParameters?.maximumDownloadQuality ? {
+          maximumDownloadQuality: requestJson["videos"][0].downloadParameters.maximumDownloadQuality
+        } : undefined
+      }
+    }]
+  });
+
+  console.debug("[Comfortable YT]", "Replaced playback data entity.");
+  // debugger;
+}
+
+// endregion
+
+(function () {
   "use strict";
 
   const wind = window.unsafeWindow;
@@ -222,28 +453,41 @@ function handleNext(nextJson) {
 
   // Apply network hook
   function applyNetworkHook() {
-    wind.XMLHttpRequest.prototype.open = function (method, url) {
-      if (url.startsWith("//")) url = `https:${url}`;
-      else if (!url.startsWith("http")) url = `${location.origin}${url}`;
-      if (!handleXMLRequest(method, url)) {
-        return;
+    const origXHR = wind.XMLHttpRequest, origFetch = wind.fetch;
+
+    wind.XMLHttpRequest = function () {
+      const xhr = new origXHR(), origOpen = xhr.open, origSend = xhr.send;
+
+      const readyStageHook = function (body, requestArgs) {
+        const resposneText = handleXMLResponse(this.readyState, this, body, requestArgs);
+        if (resposneText)
+          for (const key of ["responseText", "response"])
+            Object.defineProperty(this, key, {
+              get: function () { return xhr.readyState === 4 ? resposneText : ""; }
+            });
       }
-      // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
-      this.onreadystatechange = function () {
-        const resposneText = handleXMLResponse(this.readyState, this);
-        if (resposneText) {
-          Object.defineProperty(this, "responseText", {
-            writable: true,
-          });
-          Object.defineProperty(this, "response", {
-            writable: true,
-          });
-          this.responseText = resposneText;
-          this.response = resposneText;
-        }
+
+      xhr.open = function (method, url) {
+        if (url.startsWith("//")) url = `https:${url}`;
+        else if (!url.startsWith("http")) url = `${location.origin}${url}`;
+        // if (!handleXMLRequest(method, url)) {
+        //   return;
+        // }
+        // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
+        const requestArgs = arguments;
+        origOpen.apply(xhr, arguments);
+
+        xhr.send = (handleXMLRequest(method, new URL(url)) ? function (body) {
+          xhr.onreadystatechange = readyStageHook.bind(xhr, body, requestArgs);
+          origSend.apply(xhr, arguments);
+        } : function (_) {
+          // throw new NetworkError("Blocked");
+        }).bind(xhr);
       };
-      xmlReqFunc.apply(this, arguments);
-    };
+
+      return xhr;
+    }
+
     wind.fetch = async function (request) {
       try {
         const url = request.url || request;
@@ -251,44 +495,44 @@ function handleNext(nextJson) {
         if (!handleFetchRequest(url)) {
           return new Response();
         }
-        const response = await fetchReqFunc.apply(this, arguments);
+        const clonedRequest = request instanceof Request ? request.clone() : null;
+        const response = await origFetch.apply(this, arguments);
         if (["error", "opaqueredirect"].includes(response.type)) return response;
-        return await handleFetchResponse(response);
+        return await handleFetchResponse(clonedRequest, response);
       } catch (e) {
-        console.error("[Comfortable YT] fetch error", e);
+        console.error("[Comfortable YT]", "fetch error:", e);
       }
     };
-    wind.navigator.sendBeacon = function (url, data) {
+    wind.navigator.sendBeacon = function (..._) {
       // Block analytics data send to Youtube
       return true;
     };
-    console.info("[Comfortable YT] Network hook applied.");
+    console.info("[Comfortable YT]", "Network hook applied.");
   }
 
   // Handle xml request
   function handleXMLRequest(method, url) {
-    if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
+    if (url.pathname.startsWith("/youtubei/v1/log_event") || url.pathname.startsWith("/log")) return;
     try {
-      const parsedUrl = new URL(url);
       if (GM_getValue("audio-mode")) {
         // Replace to audio source url
         if (
-          (parsedUrl.searchParams.get("mime") || "").includes("audio") &&
+          (url.searchParams.get("mime") || "").includes("audio") &&
           !isLive
         ) {
-          parsedUrl.searchParams.delete("range");
-          lastAudioUrl = parsedUrl.toString();
+          url.searchParams.delete("range");
+          lastAudioUrl = url.toString();
           audioReplaceSrcUrl();
         }
       }
     } catch (e) {
-      console.error("[Comfortable YT] handleXMLRequest Error: ", e);
+      console.error("[Comfortable YT]", "handleXMLRequest", "Error:", e);
     }
     return true;
   }
 
   // Handle xml response
-  function handleXMLResponse(state, self) {
+  function handleXMLResponse(state, self, requestText, requestArgs) {
     if (state === 4 && self.responseURL) {
       try {
         const url = new URL(self.responseURL);
@@ -299,12 +543,28 @@ function handleNext(nextJson) {
             jsonResp = JSON.parse(self.responseText);
             handlePlayer(jsonResp);
             return JSON.stringify(jsonResp);
+          case "/youtubei/v1/browse":
+            jsonResp = JSON.parse(self.responseText);
+            handleBrowse(jsonResp);
+            return JSON.stringify(jsonResp);
+          case "/youtubei/v1/next":
+            jsonResp = JSON.parse(self.responseText);
+            handleNext(jsonResp);
+            return JSON.stringify(jsonResp);
+          case "/youtubei/v1/offline/get_download_action":
+            jsonResp = JSON.parse(self.responseText);
+            handleDownloadAction(null, jsonResp);
+            return JSON.stringify(jsonResp);
+          case "/youtubei/v1/offline/get_playback_data_entity":
+            jsonResp = JSON.parse(self.responseText);
+            handlePlaybackDataEntity(requestArgs[1], JSON.parse(requestText), jsonResp);
+            return JSON.stringify(jsonResp);
           default:
             // console.debug(url.pathname);
             break;
         }
       } catch (e) {
-        console.error("[Comfortable YT] handleXMLResponse Error: ", e);
+        console.error("[Comfortable YT]", "handleXMLResponse", `URL(${self.responseURL})`, "Error:", e);
       }
     }
   }
@@ -327,16 +587,16 @@ function handleNext(nextJson) {
         }
       }
     } catch (e) {
-      console.error("[Comfortable YT] handleFetchRequest Error: ", e);
+      console.error("[Comfortable YT]", "handleFetchRequest", "Error:", e);
     }
     return true;
   }
 
   // Handle fetch response
-  async function handleFetchResponse(resp) {
+  async function handleFetchResponse(req, resp) {
     if (!resp.headers.get("Content-Type").includes("application/json")) return resp;
     try {
-      const url = new URL(resp.url);
+      const url = new URL(resp.url || (req && req.url));
       let jsonResp;
       switch (url.pathname) {
         case "/youtubei/v1/player":
@@ -354,12 +614,22 @@ function handleNext(nextJson) {
           handleNext(jsonResp);
           resp = createFetchResponse(jsonResp, resp);
           break;
+        case "/youtubei/v1/offline/get_download_action":
+          jsonResp = await resp.json();
+          handleDownloadAction(await req.json(), jsonResp);
+          resp = createFetchResponse(jsonResp, resp);
+          break;
+        case "/youtubei/v1/offline/get_playback_data_entity":
+          jsonResp = await resp.json();
+          handlePlaybackDataEntity(req.url, await req.json(), jsonResp);
+          resp = createFetchResponse(jsonResp, resp);
+          break;
         default:
           // console.debug(url.pathname);
           break;
       }
     } catch (e) {
-      console.error("[Comfortable YT] handleFetchResponse Error: ", e);
+      console.error("[Comfortable YT]", "handleFetchResponse", `URL(${resp.url})`, "Error:", e);
     }
     return resp;
   }
@@ -393,10 +663,11 @@ function handleNext(nextJson) {
     set: function (browseJson) {
       delete wind.ytInitialData;
       handleBrowse(browseJson);
+      handleNext(browseJson);  // The next video result also visible in Initial Data
       wind.ytInitialData = browseJson;
     },
   });
 
   // Init
   applyNetworkHook();
-})(XMLHttpRequest.prototype.open, fetch);
+})();

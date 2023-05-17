@@ -7,10 +7,11 @@ Make YouTube be more comfortable to use
 Repository: <https://github.com/01101sam/Comfortable-Youtube>
 
 Features:
-- Skip ads (Only in watch page)
-- Remove "Are you there" notify box
+- Remove all ads
+- Remove "Are you there" prompt
 - Audio mode
-- Block YouTube tracing
+- Remove YouTube tracing
+- Restore Download feature for normal user
 
 Please suggest more ideas to me, you can share your idea(s) in
 
