@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.2.0
+// @version      1.2.1
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -15,6 +15,114 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // ==/UserScript==
+
+
+// region Player JSON
+
+// Remove Ads
+function removeAds(json) {
+  if (json.adPlacements) {
+    console.debug("adPlacements removed.");
+    delete json.adPlacements;
+  }
+  if (json.playerAds) {
+    console.debug("playersAds removed.");
+    delete json.playerAds;
+  }
+}
+
+// Remove "Are you there? (youThere)" Asking
+function removeYouThere(json) {
+  if (json.messages) {
+    for (const [k, v] of Object.entries(json.messages)) {
+      if ("youThereRenderer" in v) {
+        console.debug('"Are you there (youThere)" asking removed.');
+        json.messages.splice(k, 1);
+        break;
+      }
+    }
+  }
+}
+
+// Remove tracking
+function removeTracking(json) {
+  if (json.playbackTracking) {
+    ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
+      delete json.playbackTracking[urlName];
+    });
+    console.debug("Youtube tracking removed.");
+  }
+}
+
+// Modify player
+function handlePlayer(playerJson) {
+  const liveBroadcastDetails =
+    playerJson.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
+  if (liveBroadcastDetails && liveBroadcastDetails?.isLiveNow) {
+    isLive = true;
+  }
+  removeAds(playerJson);
+  removeYouThere(playerJson);
+  removeTracking(playerJson);
+}
+
+// endregion
+
+// region Browse JSON
+
+// Remove promoion overlay
+function removePromoOverlay(json) {
+  if (json.overlay?.mealbarPromoRenderer) {
+    delete json.overlay.mealbarPromoRenderer;
+    console.debug("Chrome recommendion removed.");
+  }
+}
+
+// Remove home page banner promotion
+function removeHeaderMasterThreadPromo(json) {
+  if (json.contents?.twoColumnBrowseResultsRenderer?.tabs) {
+    for (const [key, tab] of Object.entries(json.contents.twoColumnBrowseResultsRenderer.tabs)) {
+      if (
+        tab.tabRenderer?.selected &&
+        tab.tabRenderer?.content?.richGridRenderer?.masthead
+      ) {
+        const masterThread = tab.tabRenderer.content.richGridRenderer.masthead;
+        if (masterThread.bannerPromoRenderer) {
+          delete masterThread.bannerPromoRenderer;
+          console.debug("Header master thread promo removed.");
+        }
+        break;
+      }
+    }
+  }
+}
+
+// Modify browse
+function handleBrowse(browseJson) {
+  removeHeaderMasterThreadPromo(browseJson);
+  removePromoOverlay(browseJson);
+}
+
+// endregion
+
+function removeNextWatchColAd(json) {
+  if (json.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results) {
+    for (const [key, result] of Object.entries(json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults.results)) {
+      if (result.adSlotRenderer) {
+        json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults.results.splice(key, 1);
+        console.debug(`Next watch col ${key} AD removed.`);
+      }
+    }
+  }
+}
+
+// Modify next
+function handleNext(nextJson) {
+  removeNextWatchColAd(nextJson);
+}
+
+
+// endregion
 
 (function (xmlReqFunc, fetchReqFunc) {
   "use strict";
@@ -71,10 +179,10 @@
     const video = document.getElementsByTagName("video")[0];
     if (video) {
       addSettingOption("Audio Mode", "audio-mode", audioModeCall);
-    }
 
-    // Init
-    audioModeCall(GM_getValue("audio-mode"));
+      // Init
+      audioModeCall(GM_getValue("audio-mode"));
+    }
   });
 
   // Audio Mode
@@ -90,7 +198,6 @@
 
   // Audio Mode - Replace source url
   function audioReplaceSrcUrl() {
-    const player = document.getElementsByTagName("ytd-player")[0].getPlayer();
     const videoElem = document.getElementsByClassName("html5-main-video")[0];
     const isPuased = videoElem.paused;
     const currTime = videoElem.currentTime;
@@ -103,6 +210,7 @@
       videoElem.currentTime = currTime;
       if (!isPuased) videoElem.play();
     } else if (!enabled && lastAudioUrl) {
+      const player = document.getElementsByTagName("ytd-player")[0].getPlayer();
       // console.debug("Player refreshed");
       const videoId = player.getVideoData().video_id;
       player.cueVideoById(videoId);
@@ -115,6 +223,8 @@
   // Apply network hook
   function applyNetworkHook() {
     wind.XMLHttpRequest.prototype.open = function (method, url) {
+      if (url.startsWith("//")) url = `https:${url}`;
+      else if (!url.startsWith("http")) url = `${location.origin}${url}`;
       if (!handleXMLRequest(method, url)) {
         return;
       }
@@ -134,13 +244,19 @@
       };
       xmlReqFunc.apply(this, arguments);
     };
-    wind.fetch = async function (url, init) {
-        console.debug("[Comfortable YT] fetch", url, init);
-        try {
-            return !handleFetchRequest(url, init) ? new Response() : await fetchReqFunc.apply(this, arguments);
-        } catch (e) {
-            console.error("Fetch error", e);
+    wind.fetch = async function (request) {
+      try {
+        const url = request.url || request;
+        // console.debug("[Comfortable YT] fetch", url, request);
+        if (!handleFetchRequest(url)) {
+          return new Response();
         }
+        const response = await fetchReqFunc.apply(this, arguments);
+        if (["error", "opaqueredirect"].includes(response.type)) return response;
+        return await handleFetchResponse(response);
+      } catch (e) {
+        console.error("[Comfortable YT] fetch error", e);
+      }
     };
     wind.navigator.sendBeacon = function (url, data) {
       // Block analytics data send to Youtube
@@ -165,7 +281,9 @@
           audioReplaceSrcUrl();
         }
       }
-    } catch {}
+    } catch (e) {
+      console.error("[Comfortable YT] handleXMLRequest Error: ", e);
+    }
     return true;
   }
 
@@ -173,27 +291,26 @@
   function handleXMLResponse(state, self) {
     if (state === 4 && self.responseURL) {
       try {
-          const url = new URL(self.responseURL);
-          let jsonResp;
-          // console.debug("[Comfortable YT] URL Path: ", url.pathname);
-          switch (url.pathname) {
-              case "/youtubei/v1/player":
-                  jsonResp = JSON.parse(self.responseText);
-                  handlePlayer(jsonResp);
-                  return JSON.stringify(jsonResp);
-              default:
-                  // console.debug(url.pathname);
-                  break;
-          }
+        const url = new URL(self.responseURL);
+        let jsonResp;
+        // console.debug("[Comfortable YT] URL Path: ", url.pathname);
+        switch (url.pathname) {
+          case "/youtubei/v1/player":
+            jsonResp = JSON.parse(self.responseText);
+            handlePlayer(jsonResp);
+            return JSON.stringify(jsonResp);
+          default:
+            // console.debug(url.pathname);
+            break;
+        }
       } catch (e) {
-          console.error("[Comfortable YT] Error: ", e);
+        console.error("[Comfortable YT] handleXMLResponse Error: ", e);
       }
     }
   }
 
   // Handle fetch request
-  function handleFetchRequest(url, init) {
-    if (url instanceof Request) url = url.url;
+  function handleFetchRequest(url) {
     if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
     let parsedUrl;
     try {
@@ -210,27 +327,40 @@
         }
       }
     } catch (e) {
-        console.error("[Comfortable YT] Error: ", e);
+      console.error("[Comfortable YT] handleFetchRequest Error: ", e);
     }
     return true;
   }
 
   // Handle fetch response
   async function handleFetchResponse(resp) {
+    if (!resp.headers.get("Content-Type").includes("application/json")) return resp;
     try {
-        const url = new URL(resp.url);
-        let jsonResp;
-        switch (url.pathname) {
-            case "/youtubei/v1/player":
-                jsonResp = await resp.json();
-                handlePlayer(jsonResp);
-                resp = createFetchResponse(jsonResp, resp);
-                break;
-            default:
-                console.debug(url.pathname);
-                break;
-        }
-    } catch {}
+      const url = new URL(resp.url);
+      let jsonResp;
+      switch (url.pathname) {
+        case "/youtubei/v1/player":
+          jsonResp = await resp.json();
+          handlePlayer(jsonResp);
+          resp = createFetchResponse(jsonResp, resp);
+          break;
+        case "/youtubei/v1/browse":
+          jsonResp = await resp.json();
+          handleBrowse(jsonResp);
+          resp = createFetchResponse(jsonResp, resp);
+          break;
+        case "/youtubei/v1/next":
+          jsonResp = await resp.json();
+          handleNext(jsonResp);
+          resp = createFetchResponse(jsonResp, resp);
+          break;
+        default:
+          // console.debug(url.pathname);
+          break;
+      }
+    } catch (e) {
+      console.error("[Comfortable YT] handleFetchResponse Error: ", e);
+    }
     return resp;
   }
 
@@ -247,53 +377,6 @@
     return response;
   }
 
-  // Remove Ads
-  function removeAds(json) {
-    if (json.adPlacements) {
-      console.debug("adPlacements removed.");
-      delete json.adPlacements;
-    }
-    if (json.playerAds) {
-      console.debug("playersAds removed.");
-      delete json.playerAds;
-    }
-  }
-
-  // Remove "Are you there? (youThere)" Asking
-  function removeYouThere(json) {
-    if (json.messages) {
-      for (const [k, v] of Object.entries(json.messages)) {
-        if ("youThereRenderer" in v) {
-          console.debug('"Are you there (youThere)" asking removed.');
-          json.messages.splice(k, 1);
-          break;
-        }
-      }
-    }
-  }
-
-  // Remove tracking
-  function removeTracking(json) {
-    if (json.playbackTracking) {
-      ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
-        delete json.playbackTracking[urlName];
-      });
-      console.debug("Youtube tracking removed.");
-    }
-  }
-
-  // Modify player
-  function handlePlayer(playerJson) {
-    const liveBroadcastDetails =
-      playerJson.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
-    if (liveBroadcastDetails && liveBroadcastDetails?.isLiveNow) {
-      isLive = true;
-    }
-    removeAds(playerJson);
-    removeYouThere(playerJson);
-    removeTracking(playerJson);
-  }
-
   // Hook ytInitialPlayerResponse before page is fully loaded
   Object.defineProperty(wind, "ytInitialPlayerResponse", {
     configurable: true,
@@ -301,6 +384,16 @@
       delete wind.ytInitialPlayerResponse;
       handlePlayer(playerResponse);
       wind.ytInitialPlayerResponse = playerResponse;
+    },
+  });
+
+  // Hook ytInitialData before page is fully loaded
+  Object.defineProperty(wind, "ytInitialData", {
+    configurable: true,
+    set: function (browseJson) {
+      delete wind.ytInitialData;
+      handleBrowse(browseJson);
+      wind.ytInitialData = browseJson;
     },
   });
 
