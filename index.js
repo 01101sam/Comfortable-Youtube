@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.3.3
+// @version      1.3.4
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -458,38 +458,83 @@ function handlePlaybackDataEntity(url, requestJson, json) {
   function applyNetworkHook() {
     const origXHR = wind.XMLHttpRequest, origFetch = wind.fetch;
 
-    wind.XMLHttpRequest = function () {
-      const xhr = new origXHR(), origOpen = xhr.open, origSend = xhr.send;
+    class XMLHttpRequestHook {
+      constructor() {
+        const xhr = new origXHR();
 
-      const readyStageHook = function (body, requestArgs) {
-        const resposneText = handleXMLResponse(this.readyState, this, body, requestArgs);
-        if (resposneText)
-          for (const key of ["responseText", "response"])
-            Object.defineProperty(this, key, {
-              get: function () { return xhr.readyState === 4 ? resposneText : ""; }
-            });
+        // Hook original method
+        this.origOpen = xhr.open.bind(xhr);
+        this.origSend = xhr.send.bind(xhr);
+        this.xhr = xhr;
+
+        // Args store
+        this.blocked = false;  // Block sending request
+        this.requestBody = null;
+        this.requestArgs = null;
+        this.mockResponse = null;
+
+        // Hook
+        this._onreadystatechange = null;
+
+        return new Proxy(this, {
+          get(target, prop) {
+            if (prop in target)
+              return typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop];
+            else
+              return typeof target.xhr[prop] === 'function' ? xhr[prop].bind(xhr) : xhr[prop];
+          },
+          set(target, prop, value) {
+            if (prop in target)
+              target[prop] = value;
+            else
+              target.xhr[prop] = value;
+            return true;
+          }
+        });
+
       }
 
-      xhr.open = function (method, url) {
+      get response() {
+        return this.mockResponse !== null && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.response;
+      }
+
+      get responseText() {
+        return this.mockResponse !== null && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.responseText;
+      }
+
+      get onreadystatechange() {
+        return this._onreadystatechange || undefined;
+      }
+
+      set onreadystatechange(callback) {
+        this._onreadystatechange = callback;
+      }
+
+      _onreadystatechange() {
+        this.mockResponse = handleXMLResponse.apply(xhr, body, requestArgs);
+        this._onreadystatechange && this._onreadystatechange.apply(this.xhr);
+      }
+
+      open(method, url) {
         if (url.startsWith("//")) url = `https:${url}`;
         else if (!url.startsWith("http")) url = `${location.origin}${url}`;
-        // if (!handleXMLRequest(method, url)) {
-        //   return;
-        // }
         // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
-        const requestArgs = arguments;
-        origOpen.apply(xhr, arguments);
 
-        xhr.send = (handleXMLRequest(method, new URL(url)) ? function (body) {
-          xhr.onreadystatechange = readyStageHook.bind(xhr, body, requestArgs);
-          origSend.apply(xhr, arguments);
-        } : function (_) {
-          // throw new NetworkError("Blocked");
-        }).bind(xhr);
-      };
+        this.requestArgs = arguments;
+        this.origOpen.apply(this.xhr, arguments);
 
-      return xhr;
+        this.blocked = handleXMLRequest(method, new URL(url));
+      }
+
+      send(body) {
+        if (this.blocked) return;
+        if (body) this.requestBody = body;
+        this.xhr.onreadystatechange = this._onreadystatechange.bind(this);
+        this.origSend.apply(this.xhr, arguments);
+      }
     }
+
+    wind.XMLHttpRequest = XMLHttpRequestHook;
 
     wind.fetch = async function (request) {
       try {
@@ -535,31 +580,31 @@ function handlePlaybackDataEntity(url, requestJson, json) {
   }
 
   // Handle xml response
-  function handleXMLResponse(state, self, requestText, requestArgs) {
-    if (state === 4 && self.responseURL) {
+  function handleXMLResponse(requestText, requestArgs) {
+    if (this.readyState === 4 && this.responseURL) {
       try {
-        const url = new URL(self.responseURL);
+        const url = new URL(this.responseURL);
         let jsonResp;
         // console.debug("[Comfortable YT] URL Path: ", url.pathname);
         switch (url.pathname) {
           case "/youtubei/v1/player":
-            jsonResp = JSON.parse(self.responseText);
+            jsonResp = JSON.parse(this.responseText);
             handlePlayer(jsonResp);
             return JSON.stringify(jsonResp);
           case "/youtubei/v1/browse":
-            jsonResp = JSON.parse(self.responseText);
+            jsonResp = JSON.parse(this.responseText);
             handleBrowse(jsonResp);
             return JSON.stringify(jsonResp);
           case "/youtubei/v1/next":
-            jsonResp = JSON.parse(self.responseText);
+            jsonResp = JSON.parse(this.responseText);
             handleNext(jsonResp);
             return JSON.stringify(jsonResp);
           case "/youtubei/v1/offline/get_download_action":
-            jsonResp = JSON.parse(self.responseText);
+            jsonResp = JSON.parse(this.responseText);
             handleDownloadAction(null, jsonResp);
             return JSON.stringify(jsonResp);
           case "/youtubei/v1/offline/get_playback_data_entity":
-            jsonResp = JSON.parse(self.responseText);
+            jsonResp = JSON.parse(this.responseText);
             handlePlaybackDataEntity(requestArgs[1], JSON.parse(requestText), jsonResp);
             return JSON.stringify(jsonResp);
           default:
@@ -567,7 +612,7 @@ function handlePlaybackDataEntity(url, requestJson, json) {
             break;
         }
       } catch (e) {
-        console.error("[Comfortable YT]", "handleXMLResponse", `URL(${self.responseURL})`, "Error:", e);
+        console.error("[Comfortable YT]", "handleXMLResponse", `URL(${this.responseURL})`, "Error:", e);
       }
     }
   }
