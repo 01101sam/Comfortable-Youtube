@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.3.4
+// @version      1.3.5
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -472,6 +472,7 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         this.requestBody = null;
         this.requestArgs = null;
         this.mockResponse = null;
+        this.mockReadyState = null;
 
         // Hook
         this._onreadystatechange = null;
@@ -492,6 +493,10 @@ function handlePlaybackDataEntity(url, requestJson, json) {
           }
         });
 
+      }
+
+      get readyState() {
+        return this.mockReadyState !== null ? this.mockReadyState : this.xhr.readyState;
       }
 
       get response() {
@@ -523,11 +528,11 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         this.requestArgs = arguments;
         this.origOpen.apply(this.xhr, arguments);
 
-        this.blocked = handleXMLRequest(method, new URL(url));
+        this.blocked = !handleXMLRequest(method, new URL(url));
       }
 
       send(body) {
-        if (this.blocked) return;
+        if (this.blocked) return this.mockReadyState = 4;
         if (body) this.requestBody = body;
         this.xhr.onreadystatechange = this._onreadystatechange.bind(this);
         this.origSend.apply(this.xhr, arguments);
@@ -538,14 +543,16 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
     wind.fetch = async function (request) {
       try {
-        const url = request.url || request;
+        let url = request.url || request;
+        if (url.startsWith("//")) url = `https:${url}`;
+        else if (!url.startsWith("http")) url = `${location.origin}${url}`;
         // console.debug("[Comfortable YT] fetch", url, request);
         if (!handleFetchRequest(url)) {
           return new Response();
         }
         const clonedRequest = request instanceof Request ? request.clone() : null;
         const response = await origFetch.apply(this, arguments);
-        if (["error", "opaqueredirect"].includes(response.type)) return response;
+        if (["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
         return await handleFetchResponse(clonedRequest, response);
       } catch (e) {
         console.error("[Comfortable YT]", "fetch error:", e);
@@ -619,10 +626,9 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
   // Handle fetch request
   function handleFetchRequest(url) {
-    if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
-    let parsedUrl;
     try {
-      parsedUrl = new URL(url);
+      const parsedUrl = new URL(url);
+      if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
       if (GM_getValue("audio-mode")) {
         // Replace to audio source url
         if (
@@ -642,8 +648,8 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
   // Handle fetch response
   async function handleFetchResponse(req, resp) {
-    if (!resp.headers.get("Content-Type").includes("application/json")) return resp;
     try {
+      if (!(resp.headers.get("Content-Type") || "").includes("application/json")) return resp;
       const url = new URL(resp.url || (req && req.url));
       let jsonResp;
       switch (url.pathname) {
