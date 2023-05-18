@@ -5,7 +5,7 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.3.2
+// @version      1.3.3
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // @license      MIT
 // @match        https://youtube.com/*
@@ -139,11 +139,12 @@ function handleBrowse(browseJson) {
 function removeNextWatchColAd(json) {
   if (json.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results) {
     const secondaryResults = json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults, results = secondaryResults.results;
-    const { itemSectionRenderer } = results.find(result => result.itemSectionRenderer);
-    itemSectionRenderer.contents = itemSectionRenderer.contents.filter(content => {
-      if (content.adSlotRenderer) console.debug("Next watch column AD removed.");
-      return !content.adSlotRenderer;
-    });
+    const itemSectionRenderer = results.find(result => result.itemSectionRenderer)?.itemSectionRenderer;
+    if (itemSectionRenderer)
+      itemSectionRenderer.contents = itemSectionRenderer.contents.filter(content => {
+        if (content.adSlotRenderer) console.debug("Next watch column AD removed.");
+        return !content.adSlotRenderer;
+      });
   }
 }
 
