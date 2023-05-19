@@ -5,13 +5,12 @@
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
 // @author       Sam01101
-// @version      1.3.5
-// @icon         https://www.google.com/s2/favicons?domain=youtube.com
+// @version      1.4.0
+// @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
+// @run-at       document-start
 // @match        https://youtube.com/*
 // @match        https://www.youtube.com/*
-// @exclude      https://studio.youtube.com/*
-// @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // ==/UserScript==
@@ -156,14 +155,77 @@ function handleNext(nextJson) {
 
 // endregion
 
-// region Download handling
+// region Download
+
+function fetchPlayerSync(url, context, videoId) {
+  console.debug("[Comfortable YT]", "Download:", "Fetching video player response");
+
+  const xhr = window.unsafeWindow.XMLHttpRequest();
+  let playerResponseJson;
+
+  try {
+    xhr.open("POST", url, false);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.send(JSON.stringify({ context, videoId }));
+    if (xhr.status !== 200) throw new Error(`Player response status is ${xhr.status}`);
+    else if (!xhr.responseText) throw new Error("Player response is empty");
+    playerResponseJson = JSON.parse(xhr.responseText);
+    if (playerResponseJson.playabilityStatus?.status !== "OK") {
+      console.error("[Comfortable YT]", "Video player download failed:", `Player response status is ${playerResponseJson.playabilityStatus?.status}`);
+      return;
+    }
+    return playerResponseJson;
+  } catch (e) {
+    console.error("[Comfortable YT]", "Video player download failed:", "Failed to fetch player response:", e);
+    return;
+  }
+}
+
+// Handle offline video
+function handleOfflineVideo(url, requestJson, json) {
+  const requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url);
+
+  requestUrl.pathname = "/youtubei/v1/player";
+
+  // Fetch playerResponseJson
+  const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, requestJson.videoIds[0]);
+  if (!playerResponseJson) return;
+
+  console.debug("Replaced offline video data.");
+  return {
+    responseContext: playerResponseJson.responseContext,
+    videos: [{
+      offlineVideoData: {
+        videoId: requestJson.videoIds[0],
+        thumbnail: playerResponseJson.videoDetails.thumbnail,
+        channel: {
+          offlineChannelData: {
+            channelId: playerResponseJson.videoDetails.channelId,
+            thumbnail: playerResponseJson.microformat.playerMicroformatRenderer.thumbnail,
+            title: playerResponseJson.videoDetails.author,
+            isChannelOwner: playerResponseJson.videoDetails.isOwnerViewing
+          }
+        },
+        title: playerResponseJson.videoDetails.title,
+        lengthText: "0:00",
+        publishedTimestamp: "0",
+        viewCount: playerResponseJson.videoDetails.viewCount,
+        shareUrl: `https://youtu.be/${playerResponseJson.videoDetails.videoId}`,
+        description: playerResponseJson.microformat.playerMicroformatRenderer.description,
+        shortViewCountText: playerResponseJson.videoDetails.viewCount,
+        likesCount: "0",
+        lengthSeconds: playerResponseJson.videoDetails.lengthSeconds
+      }
+    }]
+  }
+}
 
 // Handle download action
 function handleDownloadAction(requestJson, json) {
   const videoId = requestJson["videoId"],
     formatType = requestJson["preferredFormatType"],
     entityKey = btoa(atob("EgsAAAAAAAAAAAAAACDKASgB").replace("\x00".repeat(11), videoId));
-  // debugger;
   if (json.onResponseReceivedCommand.openPopupAction?.popup?.offlinePromoRenderer) {  // Not premium
     const clickTrackingParams = json.onResponseReceivedCommand.clickTrackingParams;
     const commandOne = requestJson.preferredFormatType === "UNKNOWN_FORMAT_TYPE" ? {
@@ -286,26 +348,8 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
 
   // Fetch playerResponseJson
-  let playerResponseJson;
-  try {
-    console.debug("[Comfortable YT]", "Download:", "Fetching player response");
-    const xhr = window.unsafeWindow.XMLHttpRequest();
-    xhr.open("POST", requestUrl.toString(), false);
-    xhr.send(JSON.stringify({
-      context: requestJson.context,
-      videoId: atob(decodeURIComponent(entityKey)).substring(2, 13)
-    }));
-    if (xhr.status !== 200) throw new Error(`Player response status is ${xhr.status}`);
-    else if (!xhr.responseText) throw new Error("Player response is empty");
-    playerResponseJson = JSON.parse(xhr.responseText);
-    if (playerResponseJson.playabilityStatus?.status !== "OK") {
-      console.error("[Comfortable YT]", "Video download failed:", `Player response status is ${playerResponseJson.playabilityStatus?.status}`);
-      return;
-    }
-  } catch (e) {
-    console.error("[Comfortable YT]", "Video download failed:", "Failed to fetch player response:", e);
-    return;
-  }
+  const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, atob(decodeURIComponent(entityKey)).substring(2, 13));
+  if (!playerResponseJson) return;
 
   // Edit offlineVideoPolicy
   Object.assign(mutations[0].payload.offlineVideoPolicy, {
@@ -352,8 +396,7 @@ function handlePlaybackDataEntity(url, requestJson, json) {
     }]
   });
 
-  console.debug("[Comfortable YT]", "Replaced playback data entity.");
-  // debugger;
+  console.debug("Replaced playback data entity.");
 }
 
 // endregion
@@ -456,15 +499,15 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
   // Apply network hook
   function applyNetworkHook() {
-    const origXHR = wind.XMLHttpRequest, origFetch = wind.fetch;
+    const OldXMLHttpRequest = wind.XMLHttpRequest, origFetch = wind.fetch;
 
     class XMLHttpRequestHook {
       constructor() {
-        const xhr = new origXHR();
+        const xhr = new OldXMLHttpRequest();
 
         // Hook original method
-        this.origOpen = xhr.open.bind(xhr);
-        this.origSend = xhr.send.bind(xhr);
+        this._open = xhr.open.bind(xhr);
+        this._send = xhr.send.bind(xhr);
         this.xhr = xhr;
 
         // Args store
@@ -473,100 +516,129 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         this.requestArgs = null;
         this.mockResponse = null;
         this.mockReadyState = null;
+        this.mockStatus = null;
 
-        // Hook
-        this._onreadystatechange = null;
+        // Callback
+        this.callbacks = {};
+      }
 
-        return new Proxy(this, {
-          get(target, prop) {
-            if (prop in target)
-              return typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop];
-            else
-              return typeof target.xhr[prop] === 'function' ? xhr[prop].bind(xhr) : xhr[prop];
-          },
-          set(target, prop, value) {
-            if (prop in target)
-              target[prop] = value;
-            else
-              target.xhr[prop] = value;
-            return true;
-          }
-        });
-
+      get status() {
+        return this.mockStatus ? this.mockStatus : this.xhr.status;
       }
 
       get readyState() {
-        return this.mockReadyState !== null ? this.mockReadyState : this.xhr.readyState;
+        return this.mockReadyState ? this.mockReadyState : this.xhr.readyState;
       }
 
       get response() {
-        return this.mockResponse !== null && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.response;
+        return this.mockResponse && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.response;
       }
 
       get responseText() {
-        return this.mockResponse !== null && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.responseText;
+        return this.mockResponse && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.responseText;
       }
 
-      get onreadystatechange() {
-        return this._onreadystatechange || undefined;
+      addEventListener(event, callback) {
+        if ([
+          "loadstart",
+          "progress",
+          "load",
+          "loadend",
+          "readystatechange"
+        ].includes(event))
+          return this.callbacks[event] = callback;
+        return this.xhr[`on${event}`] = callback;
       }
 
-      set onreadystatechange(callback) {
-        this._onreadystatechange = callback;
-      }
-
-      _onreadystatechange() {
-        this.mockResponse = handleXMLResponse.apply(xhr, body, requestArgs);
-        this._onreadystatechange && this._onreadystatechange.apply(this.xhr);
+      eventHook() {
+        this.mockResponse = handleXMLResponse.call(this.xhr, this, this.requestBody, this.requestArgs);
       }
 
       open(method, url) {
         if (url.startsWith("//")) url = `https:${url}`;
         else if (!url.startsWith("http")) url = `${location.origin}${url}`;
+        let parsedUrl;
+        try {
+          parsedUrl = new URL(url);
+        } catch (e) {
+          return this.xhr.open.apply(this.xhr, arguments);
+        }
         // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
 
+        this._open.apply(this.xhr, arguments);
         this.requestArgs = arguments;
-        this.origOpen.apply(this.xhr, arguments);
-
-        this.blocked = !handleXMLRequest(method, new URL(url));
+        if (!handleRequest("XML", method, parsedUrl)) {
+          this.blocked = true;
+          this.mockReadyState = 4;
+          // console.debug("[Comfortable YT] Blocked:", method, url);
+        }
       }
 
       send(body) {
-        if (this.blocked) return this.mockReadyState = 4;
+        if (this.blocked) {
+          Object.values(this.callbacks).forEach(callback => callback.call(this.xhr));
+          return;
+        }
         if (body) this.requestBody = body;
-        this.xhr.onreadystatechange = this._onreadystatechange.bind(this);
-        this.origSend.apply(this.xhr, arguments);
+        const that = this;
+        Object.entries(this.callbacks).forEach(([event, callback]) => this.xhr[`on${event}`] = function () {
+          (`${event}Hook` in that ? that[`${event}Hook`] : that.eventHook).call(that);
+          callback.call(that);
+        });
+        if (!Object.keys(this.callbacks).length) this.xhr.onreadystatechange = this.eventHook.bind(this);
+        this._send.apply(this.xhr, arguments);
       }
     }
 
-    wind.XMLHttpRequest = XMLHttpRequestHook;
+    const xmlHttpRequestHook = function () {
+      const hook = new XMLHttpRequestHook(), xhr = hook.xhr;
+      return new Proxy(xhr, {
+        get(_, key) {
+          if (key.startsWith("on") && key.substring(2) in hook.callbacks)
+            return hook.callbacks[key.substring(2)];
+          const value = (key in hook ? hook : xhr)[key];
+          return typeof value === 'function' ? value.bind(key in hook ? hook : xhr) : value;
+        },
+        set(_, key, value) {
+          if (key.startsWith("on")) {
+            // Usually event listener
+            if (typeof value === 'function') {
+              hook.addEventListener(key.substring(2), value);
+              return true;
+            }
+          }
+          (key in hook ? hook : xhr)[key] = value;
+          return true;
+        }
+      });
 
-    wind.fetch = async function (request) {
+    }
+
+    const fetchHook = async function (request) {
       try {
         let url = request.url || request;
         if (url.startsWith("//")) url = `https:${url}`;
         else if (!url.startsWith("http")) url = `${location.origin}${url}`;
-        // console.debug("[Comfortable YT] fetch", url, request);
-        if (!handleFetchRequest(url)) {
-          return new Response();
-        }
+        if (!handleRequest("Fetch", request.method || "GET", new URL(url))) return new Response();
         const clonedRequest = request instanceof Request ? request.clone() : null;
+
+        // console.debug("[Comfortable YT] fetch", url, request);
         const response = await origFetch.apply(this, arguments);
         if (["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
         return await handleFetchResponse(clonedRequest, response);
       } catch (e) {
         console.error("[Comfortable YT]", "fetch error:", e);
       }
-    };
-    wind.navigator.sendBeacon = function (..._) {
-      // Block analytics data send to Youtube
-      return true;
-    };
+    }
+
+    wind.XMLHttpRequest = xmlHttpRequestHook;
+    wind.fetch = fetchHook;
+    wind.navigator.sendBeacon = (url, data) => true;  // Block analytics data sent to Youtube
     console.info("[Comfortable YT]", "Network hook applied.");
   }
 
-  // Handle xml request
-  function handleXMLRequest(method, url) {
+  // Handle request
+  function handleRequest(source, method, url) {
     if (url.pathname.startsWith("/youtubei/v1/log_event") || url.pathname.startsWith("/log")) return;
     try {
       if (GM_getValue("audio-mode")) {
@@ -581,13 +653,13 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         }
       }
     } catch (e) {
-      console.error("[Comfortable YT]", "handleXMLRequest", "Error:", e);
+      console.error("[Comfortable YT]", `handle${source}Request`, "Error:", e);
     }
     return true;
   }
 
   // Handle xml response
-  function handleXMLResponse(requestText, requestArgs) {
+  function handleXMLResponse(hook, requestText, requestArgs) {
     if (this.readyState === 4 && this.responseURL) {
       try {
         const url = new URL(this.responseURL);
@@ -605,6 +677,13 @@ function handlePlaybackDataEntity(url, requestJson, json) {
           case "/youtubei/v1/next":
             jsonResp = JSON.parse(this.responseText);
             handleNext(jsonResp);
+            return JSON.stringify(jsonResp);
+          case "/youtubei/v1/offline":
+            if (this.status !== 401) return;
+            jsonResp = JSON.parse(this.responseText);
+            jsonResp = handleOfflineVideo(requestArgs[1], JSON.parse(requestText), jsonResp);
+            Object.defineProperty(hook, "status", { writable: true });
+            hook.status = 200;
             return JSON.stringify(jsonResp);
           case "/youtubei/v1/offline/get_download_action":
             jsonResp = JSON.parse(this.responseText);
@@ -624,33 +703,13 @@ function handlePlaybackDataEntity(url, requestJson, json) {
     }
   }
 
-  // Handle fetch request
-  function handleFetchRequest(url) {
-    try {
-      const parsedUrl = new URL(url);
-      if (url.startsWith("/youtubei/v1/log_event") || url.startsWith("/log")) return;
-      if (GM_getValue("audio-mode")) {
-        // Replace to audio source url
-        if (
-          (parsedUrl.searchParams.get("mime") || "").includes("audio") &&
-          !isLive
-        ) {
-          parsedUrl.searchParams.delete("range");
-          lastAudioUrl = parsedUrl.toString();
-          audioReplaceSrcUrl();
-        }
-      }
-    } catch (e) {
-      console.error("[Comfortable YT]", "handleFetchRequest", "Error:", e);
-    }
-    return true;
-  }
-
   // Handle fetch response
   async function handleFetchResponse(req, resp) {
     try {
       if (!(resp.headers.get("Content-Type") || "").includes("application/json")) return resp;
       const url = new URL(resp.url || (req && req.url));
+      if (!url.pathname.startsWith("/youtubei/v1/")) return resp;
+
       let jsonResp;
       switch (url.pathname) {
         case "/youtubei/v1/player":
@@ -667,6 +726,12 @@ function handlePlaybackDataEntity(url, requestJson, json) {
           jsonResp = await resp.json();
           handleNext(jsonResp);
           resp = createFetchResponse(jsonResp, resp);
+          break;
+        case "/youtubei/v1/offline":
+          if (resp.status === 401) return;
+          jsonResp = await resp.json();
+          jsonResp = handleOfflineVideo(req.url, await req.json(), jsonResp);
+          resp = createFetchResponse(jsonResp, resp, 200);
           break;
         case "/youtubei/v1/offline/get_download_action":
           jsonResp = await resp.json();
@@ -689,9 +754,9 @@ function handlePlaybackDataEntity(url, requestJson, json) {
   }
 
   // Handle fetch response body
-  function createFetchResponse(json, data) {
+  function createFetchResponse(json, data, customStatus) {
     const response = new Response(JSON.stringify(json), {
-      status: data.status,
+      status: customStatus || data.status,
       statusText: data.statusText,
       headers: data.headers,
     });
