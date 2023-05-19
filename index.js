@@ -1,16 +1,23 @@
 // ==UserScript==
 // @name         Comfortable Youtube
 // @description  Make Youtube be more comfortable to use
-// @namespace    https://github.com/01101sam
+// @encoding     utf-8
+// @namespace    https://github.com/01101sam/Comfortable-Youtube
 // @homepage     https://github.com/01101sam/Comfortable-Youtube
 // @supportURL   https://github.com/01101sam/Comfortable-Youtube/issues
+// @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
+// @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.4.0
+// @version      1.4.1
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
-// @match        https://youtube.com/*
-// @match        https://www.youtube.com/*
+// @match        http*://youtube.com/*
+// @match        http*://www.youtube.com/*
+// @compatible   chrome
+// @compatible   firefox
+// @compatible   edge
+// @connect      youtube.com
 // @grant        GM_setValue
 // @grant        GM_getValue
 // ==/UserScript==
@@ -334,18 +341,13 @@ function handlePlaybackDataEntity(url, requestJson, json) {
     return encodeURIComponent(base64Encoded);
   }
 
-  const mutations = json.frameworkUpdates.entityBatchUpdate.mutations;
-
-  // Only for download failed mode
-  // if (mutations[0].payload.offlineVideoPolicy.action !== "OFFLINE_VIDEO_POLICY_ACTION_DOWNLOAD_FAILED")
-  //   return;
-
-  const entityKey = requestJson["videos"][0]["entityKey"],
+  const mutations = json.frameworkUpdates.entityBatchUpdate.mutations,
+    entityKey = requestJson["videos"][0]["entityKey"],
     transferEntityKey = toTransferKey(entityKey),
     requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url),
     lastUpdatedTimestampSeconds = Number(mutations[0].payload.offlineVideoPolicy.lastUpdatedTimestampSeconds);
-  requestUrl.pathname = "/youtubei/v1/player";
 
+  requestUrl.pathname = "/youtubei/v1/player";  
 
   // Fetch playerResponseJson
   const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, atob(decodeURIComponent(entityKey)).substring(2, 13));
@@ -358,7 +360,12 @@ function handlePlaybackDataEntity(url, requestJson, json) {
     expirationTimestamp: lastUpdatedTimestampSeconds + (1 * 60 * 60 * 24 * 365),  // 1 Year
   });
 
-  // // Edit playbackData
+  if (requestJson["videos"][0]["refreshData"]) {  // Offline video refresh
+    console.debug("Replaced offline video refresh playback data entity.");
+    return;
+  }
+
+  // Edit playbackData
   Object.assign(mutations[1].payload.playbackData, {
     transfer: transferEntityKey,
     streamDownloadTimestampSeconds: mutations[1].payload.playbackData.playerResponseTimestamp,
@@ -368,9 +375,9 @@ function handlePlaybackDataEntity(url, requestJson, json) {
       microformat: playerResponseJson.microformat,
       offlineState: {
         action: "OK",
-        expiresInSeconds: 10,  // 1 Year
+        expiresInSeconds: 1 * 60 * 60 * 24 * 365,  // 1 Year
         isOfflineSharingAllowed: true,
-        refreshInSeconds: 37355,  // 37355
+        refreshInSeconds: 1 * 60 * 60 * 24 * 365,  // 1 Year
       },
       playabilityStatus: playerResponseJson.playabilityStatus,
       playbackTracking: playerResponseJson.playbackTracking,
