@@ -8,7 +8,7 @@
 // @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.4.1
+// @version      1.4.2
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
@@ -35,6 +35,37 @@ function getTime() {
   };
 }
 
+function numberFormat(numberState) {
+  return getNumberFormatter().format(numberState);
+}
+
+// https://github.com/search?q=repo%3AAnarios/return-youtube-dislike%20getNumberFormatter&type=code
+function getNumberFormatter() {
+  let userLocales;
+  if (document.documentElement.lang) {
+    userLocales = document.documentElement.lang;
+  } else if (navigator.language) {
+    userLocales = navigator.language;
+  } else {
+    try {
+      userLocales = new URL(
+        Array.from(document.querySelectorAll("head > link[rel='search']"))
+          ?.find((n) => n?.getAttribute("href")?.includes("?locale="))
+          ?.getAttribute("href")
+      )?.searchParams?.get("locale");
+    } catch {
+      cLog(
+        "Cannot find browser locale. Use en as default for number formatting."
+      );
+      userLocales = "en";
+    }
+  }
+
+  return Intl.NumberFormat(userLocales, {
+    notation: "compact",
+    compactDisplay: "short",
+  });
+}
 
 // region Player JSON
 
@@ -116,7 +147,7 @@ function removePromoOverlay(json) {
 // Remove home page banner promotion
 function removeHeaderMasterThreadPromo(json) {
   if (json.contents?.twoColumnBrowseResultsRenderer?.tabs) {
-    const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content.richGridRenderer)?.tabRenderer?.content;
+    const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content?.richGridRenderer)?.tabRenderer?.content;
     if (tab)
       tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(content => {
         if (content.richItemRenderer?.content?.adSlotRenderer)
@@ -206,22 +237,22 @@ function handleOfflineVideo(url, requestJson, json) {
       offlineVideoData: {
         videoId: requestJson.videoIds[0],
         thumbnail: playerResponseJson.videoDetails.thumbnail,
-        channel: {
-          offlineChannelData: {
-            channelId: playerResponseJson.videoDetails.channelId,
-            thumbnail: playerResponseJson.microformat.playerMicroformatRenderer.thumbnail,
-            title: playerResponseJson.videoDetails.author,
-            isChannelOwner: playerResponseJson.videoDetails.isOwnerViewing
-          }
-        },
+        // channel: {
+        //   offlineChannelData: {
+        //     channelId: playerResponseJson.videoDetails.channelId,
+        //     thumbnail: playerResponseJson.microformat.playerMicroformatRenderer.thumbnail,
+        //     title: playerResponseJson.videoDetails.author,
+        //     isChannelOwner: playerResponseJson.videoDetails.isOwnerViewing
+        //   }
+        // },
         title: playerResponseJson.videoDetails.title,
-        lengthText: "0:00",
-        publishedTimestamp: "0",
+        // lengthText: "0:00",
+        // publishedTimestamp: "0",
         viewCount: playerResponseJson.videoDetails.viewCount,
         shareUrl: `https://youtu.be/${playerResponseJson.videoDetails.videoId}`,
         description: playerResponseJson.microformat.playerMicroformatRenderer.description,
-        shortViewCountText: playerResponseJson.videoDetails.viewCount,
-        likesCount: "0",
+        shortViewCountText: numberFormat(playerResponseJson.videoDetails.viewCount),
+        // likesCount: "0",
         lengthSeconds: playerResponseJson.videoDetails.lengthSeconds
       }
     }]
@@ -347,7 +378,7 @@ function handlePlaybackDataEntity(url, requestJson, json) {
     requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url),
     lastUpdatedTimestampSeconds = Number(mutations[0].payload.offlineVideoPolicy.lastUpdatedTimestampSeconds);
 
-  requestUrl.pathname = "/youtubei/v1/player";  
+  requestUrl.pathname = "/youtubei/v1/player";
 
   // Fetch playerResponseJson
   const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, atob(decodeURIComponent(entityKey)).substring(2, 13));
