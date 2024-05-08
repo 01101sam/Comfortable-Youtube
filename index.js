@@ -8,7 +8,7 @@
 // @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.4.3
+// @version      1.4.4
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
@@ -71,7 +71,7 @@ function getNumberFormatter() {
 
 // Remove Ads
 function removeAds(json) {
-  for (const key of ["adPlacements", "playerAds"]) {
+  for (const key of ["adBreakHeartbeatParams", "adPlacements", "adSlots", "playerAds"]) {
     if (json[key]) {
       console.debug(`Video ${key} removed.`);
       delete json[key];
@@ -136,6 +136,15 @@ function handlePlayer(playerJson) {
 
 // region Browse JSON
 
+const browseJsonFilterRenderFunc = content => {
+  const deleteRender = !(
+    content.richItemRenderer?.content?.adSlotRenderer ||
+    content.richSectionRenderer?.content?.statementBannerRenderer?.titleFontFamily === "PROMO_FONT_FAMILY_YOUTUBE_SANS_BOLD"
+  );
+  if (!deleteRender) console.debug("Video slot AD removed.");
+  return deleteRender;
+};
+
 // Remove promoion overlay
 function removePromoOverlay(json) {
   if (json.overlay?.mealbarPromoRenderer) {
@@ -149,14 +158,7 @@ function removeHeaderMasterThreadPromo(json) {
   if (json.contents?.twoColumnBrowseResultsRenderer?.tabs) {
     const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content?.richGridRenderer)?.tabRenderer?.content;
     if (tab)
-      tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(content => {
-        const deleteRender = !(
-          content.richItemRenderer?.content?.adSlotRenderer ||
-          content.richSectionRenderer?.content?.statementBannerRenderer?.titleFontFamily === "PROMO_FONT_FAMILY_YOUTUBE_SANS_BOLD"
-        );
-        if (!deleteRender) console.debug("Video slot AD removed.");
-        return deleteRender;
-      });
+      tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(browseJsonFilterRenderFunc);
     if (
       tab &&
       tab.richGridRenderer.masthead &&
@@ -171,10 +173,20 @@ function removeHeaderMasterThreadPromo(json) {
   }
 }
 
+// Remove home page feed promotion (For continue browsing homepage)
+function removeHomePageFeedPrototion(json) {
+  if (json.onResponseReceivedActions) {
+    const actions = json.onResponseReceivedActions.find(action => action.appendContinuationItemsAction);
+    if (actions)
+        actions.appendContinuationItemsAction.continuationItems = actions.appendContinuationItemsAction.continuationItems.filter(browseJsonFilterRenderFunc);
+  }
+}
+
 // Modify browse
 function handleBrowse(browseJson) {
   removePromoOverlay(browseJson);
   removeHeaderMasterThreadPromo(browseJson);
+  removeHomePageFeedPrototion(browseJson);
 }
 
 // endregion
