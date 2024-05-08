@@ -8,7 +8,7 @@
 // @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.4.2
+// @version      1.4.3
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
@@ -150,14 +150,20 @@ function removeHeaderMasterThreadPromo(json) {
     const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content?.richGridRenderer)?.tabRenderer?.content;
     if (tab)
       tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(content => {
-        if (content.richItemRenderer?.content?.adSlotRenderer)
-          console.debug("Video slot AD removed.");
-        return !content.richItemRenderer?.content?.adSlotRenderer;
+        const deleteRender = !(
+          content.richItemRenderer?.content?.adSlotRenderer ||
+          content.richSectionRenderer?.content?.statementBannerRenderer?.titleFontFamily === "PROMO_FONT_FAMILY_YOUTUBE_SANS_BOLD"
+        );
+        if (!deleteRender) console.debug("Video slot AD removed.");
+        return deleteRender;
       });
     if (
       tab &&
       tab.richGridRenderer.masthead &&
-      tab.richGridRenderer.masthead.bannerPromoRenderer
+      (
+        tab.richGridRenderer.masthead.bannerPromoRenderer ||
+        tab.richGridRenderer.masthead.adSlotRenderer
+      )
     ) {
       delete tab.richGridRenderer.masthead;
       console.debug("Removed home page banner promotion.");
