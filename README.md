@@ -27,7 +27,7 @@ For workflow of DMCA Takedown request, please refer to [GitHub DMCA Takedown Pol
 # Features
 - Remove all ads
 - Remove "Are you still there" prompt
-- Audio mode
+- [ ] Audio mode (Buggy and likely not working right now)
 - Remove YouTube tracing
 - Restore Premium feature of Download for normal user
 - [ ] UI Panel for settings
