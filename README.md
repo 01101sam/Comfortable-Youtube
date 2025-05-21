@@ -29,7 +29,7 @@ For workflow of DMCA Takedown request, please refer to [GitHub DMCA Takedown Pol
 - Remove "Are you still there" prompt
 - [ ] Audio mode (Buggy and likely not working right now)
 - Remove YouTube tracing
-- Restore Premium feature of Download for normal user
+- [ ] Restore Premium feature of Download for normal user
 - [ ] UI Panel for settings
     - [ ] Button hiding
     - [ ] Passive comment (A button to load comments)
