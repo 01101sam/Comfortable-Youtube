@@ -1,0 +1,49 @@
+# Manually trigger a Greasy Fork sync.
+# Simulates a GitHub push webhook so Greasy Fork pulls the script from the current commit.
+name: Sync to Greasy Fork
+
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: Path of the script file to sync
+        default: index.js
+        required: true
+      message:
+        description: Changelog
+        default: Manual sync
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send signed push event to Greasy Fork
+        env:
+          SECRET: ${{ secrets.GREASYFORK_WEBHOOK_SECRET }}
+          WEBHOOK_URL: https://api.greasyfork.org/users/797472-sam01101/webhook
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          FILE: ${{ inputs.file }}
+          MESSAGE: ${{ inputs.message }}
+        run: |
+          body=$(jq -cn --arg ref "$REF" --arg repo "$REPO_URL" --arg sha "$SHA" \
+            --arg file "$FILE" --arg msg "$MESSAGE" \
+            '{ref: $ref,
+              repository: {html_url: $repo, clone_url: ($repo + ".git")},
+              commits: [{id: $sha, message: $msg, modified: [$file]}]}')
+          # Greasy Fork only verifies the sha1 signature (X-Hub-Signature)
+          sig=$(printf '%s' "$body" | openssl dgst -sha1 -hmac "$SECRET" | awk '{print $NF}')
+          response=$(curl -sS -w '\n%{http_code}' -X POST "$WEBHOOK_URL" \
+            -H 'User-Agent: GitHub-Hookshot/manual-dispatch' \
+            -H 'Content-Type: application/json' \
+            -H 'X-GitHub-Event: push' \
+            -H "X-Hub-Signature: sha1=$sig" \
+            -d "$body")
+          status=$(tail -n1 <<<"$response")
+          echo "HTTP $status"
+          sed '$d' <<<"$response"
+          [ "$status" = 200 ] || exit 1
+          # Treat a 200 response with failed updates as a failure too
+          sed '$d' <<<"$response" | jq -e '.updated_failed | length == 0' >/dev/null
