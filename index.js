@@ -8,7 +8,7 @@
 // @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.4.5
+// @version      1.5.0
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
@@ -20,8 +20,14 @@
 // @connect      youtube.com
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
 // ==/UserScript==
 // noinspection ExceptionCaughtLocallyJS
+
+const wind = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+const AUDIO_MODE_KEY = "audio-mode";
+let fetchingForDownload = false;
 
 // Utils
 function getTime() {
@@ -55,9 +61,6 @@ function getNumberFormatter() {
                     ?.getAttribute("href")
             )?.searchParams?.get("locale");
         } catch {
-            cLog(
-                "Cannot find browser locale. Use en as default for number formatting."
-            );
             userLocales = "en";
         }
     }
@@ -68,186 +71,173 @@ function getNumberFormatter() {
     });
 }
 
-// region Player JSON
-
-// Remove Ads
-function removeAds(json) {
-    for (const key of ["adBreakHeartbeatParams", "adPlacements", "adSlots", "playerAds"]) {
-        if (json[key]) {
-            console.debug(`Video ${key} removed.`);
-            delete json[key];
-        }
+function runStep(name, step) {
+    try {
+        step();
+    } catch (e) {
+        console.error("[Comfortable YT]", name, "Error:", e);
     }
 }
 
-// Remove "Are you there? (youThere)" Prompt
-function removeYouThere(json) {
-    if (json.messages)
-        json.messages = json.messages.filter(message => {
-            if ("youThereRenderer" in message)
-                console.debug('"Are you there (youThere)" asking removed.');
-            return !("youThereRenderer" in message);
-        });
+const AD_KEYS = new Set(["adPlacements", "adSlots", "playerAds", "adBreakHeartbeatParams"]);
+
+const AD_RENDERERS = new Set([
+    "adSlotRenderer",
+    "searchPyvRenderer",
+    "promotedSparklesWebRenderer",
+    "promotedSparklesTextSearchRenderer",
+    "promotedVideoRenderer",
+    "compactPromotedVideoRenderer",
+    "bannerPromoRenderer",
+    "videoMastheadAdV3Renderer",
+    "brandVideoShelfRenderer",
+    "brandVideoSingletonRenderer",
+    "mealbarPromoRenderer",
+    "youThereRenderer",
+    "guideSigninPromoRenderer",
+]);
+
+function isAdRendererEntry(key, value) {
+    if (AD_RENDERERS.has(key)) return true;
+    return key === "statementBannerRenderer" && value?.titleFontFamily === "PROMO_FONT_FAMILY_YOUTUBE_SANS_BOLD";
 }
 
-// Remove tracking
-function removeTracking(json) {
-    if (json.playbackTracking) {
+function hasAdRenderer(obj) {
+    return Object.entries(obj).some(([key, value]) => isAdRendererEntry(key, value));
+}
+
+function isAdItem(item) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    if (hasAdRenderer(item)) return true;
+    if (item.command?.reelWatchEndpoint?.adClientParams?.isAd) return true;
+    return Object.values(item).some(value => {
+        const content = value?.content;
+        return content && typeof content === "object" && !Array.isArray(content) && hasAdRenderer(content);
+    });
+}
+
+function removeTracking(playerJson) {
+    if (playerJson.playbackTracking) {
         ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
-            delete json.playbackTracking[urlName];
+            delete playerJson.playbackTracking[urlName];
         });
-        console.debug("Youtube tracking removed.");
     }
 }
 
-// Restore download feature
-function restoreDownload(json) {
-    if (json.frameworkUpdates.entityBatchUpdate?.mutations) {
-        const payload = json.frameworkUpdates.entityBatchUpdate.mutations[0].payload;
-        if (payload.offlineabilityEntity && payload.offlineabilityEntity.addToOfflineButtonState !== "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED") {
-            const entityKey = payload.offlineabilityEntity.key;
-            payload.offlineabilityEntity = {
-                addToOfflineButtonState: "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED",
-                contentCheckOk: false,
-                key: entityKey,
-                racyCheckOk: false,
-                offlineabilityRenderer: "CAEaGQoVChMKEeWFqOmrmOa4hSAoMTA4MHApGAcaEgoOCgwKCumrmCAoNzIwcCkYAhoSCg4KDAoK5LitICgzNjBwKRgBGhIKDgoMCgrkvY4gKDE0NHApGAQiDTILb2ZmbGluZWxpc3Q="
-            }
-            if (!json.playabilityStatus.offlineability)
-                json.playabilityStatus.offlineability = { "offlineabilityRenderer": { "offlineable": true } }
-            console.debug("Download feature restored.");
+function keepBestAudioFormats(playerJson) {
+    const formats = playerJson.streamingData?.adaptiveFormats;
+    if (!formats || fetchingForDownload || !GM_getValue(AUDIO_MODE_KEY)) return;
+    const best = new Map();
+    for (const format of formats) {
+        if (!format.mimeType?.startsWith("audio/") || format.isDrc || format.audioTrack?.audioIsDefault === false) continue;
+        const container = format.mimeType.split(";")[0];
+        if (!best.has(container) || best.get(container).bitrate < format.bitrate) best.set(container, format);
+    }
+    if (!best.size) return;
+    const kept = new Set(best.values());
+    playerJson.streamingData.adaptiveFormats = formats.filter(format => !format.mimeType?.startsWith("audio/") || kept.has(format));
+    console.debug("[Comfortable YT]", "Audio mode: kept audio formats", [...kept].map(format => format.itag).join(", "));
+}
+
+function restoreDownload(playerJson) {
+    const payload = playerJson.frameworkUpdates?.entityBatchUpdate?.mutations
+        ?.find(mutation => mutation.payload?.offlineabilityEntity)?.payload;
+    if (!payload || payload.offlineabilityEntity.addToOfflineButtonState === "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED") return;
+    const entityKey = payload.offlineabilityEntity.key;
+    payload.offlineabilityEntity = {
+        addToOfflineButtonState: "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED",
+        contentCheckOk: false,
+        key: entityKey,
+        racyCheckOk: false,
+        offlineabilityRenderer: "CAEaGQoVChMKEeWFqOmrmOa4hSAoMTA4MHApGAcaEgoOCgwKCumrmCAoNzIwcCkYAhoSCg4KDAoK5LitICgzNjBwKRgBGhIKDgoMCgrkvY4gKDE0NHApGAQiDTILb2ZmbGluZWxpc3Q="
+    };
+    if (playerJson.playabilityStatus && !playerJson.playabilityStatus.offlineability)
+        playerJson.playabilityStatus.offlineability = { offlineabilityRenderer: { offlineable: true } };
+    console.debug("Download feature restored.");
+}
+
+/**
+ * Non-Premium accounts get the download item only in the overflow menu, which hides download progress.
+ * Move it to the front of the action bar with a download button, as Premium has it.
+ * YouTube moves it back into the menu when the bar runs out of space.
+ */
+function moveDownloadToActions(menu) {
+    if (!Array.isArray(menu.items) || !Array.isArray(menu.flexibleItems)) return;
+    if (menu.flexibleItems.some(item => item.menuFlexibleItemRenderer?.topLevelButton?.downloadButtonRenderer)) return;
+    const index = menu.items.findIndex(item => item.menuServiceItemDownloadRenderer?.serviceEndpoint?.offlineVideoEndpoint);
+    if (index < 0) return;
+    const [{ menuServiceItemDownloadRenderer: menuItem }] = menu.items.splice(index, 1);
+    delete menuItem.subtitleText;
+    const endpoint = menuItem.serviceEndpoint;
+    menu.flexibleItems.unshift({
+        menuFlexibleItemRenderer: {
+            menuItem: { menuServiceItemDownloadRenderer: menuItem },
+            topLevelButton: {
+                downloadButtonRenderer: {
+                    trackingParams: menuItem.trackingParams,
+                    style: "STYLE_DEFAULT",
+                    size: "SIZE_DEFAULT",
+                    targetId: "watch-download-button",
+                    hasLabel: true,
+                    command: { ...endpoint, offlineVideoEndpoint: { ...endpoint.offlineVideoEndpoint, action: "ACTION_ADD" } },
+                },
+            },
+        },
+    });
+    console.debug("[Comfortable YT]", "Download:", "Moved download button to actions.");
+}
+
+function cleanJson(node) {
+    if (Array.isArray(node)) {
+        for (let i = node.length - 1; i >= 0; i--) {
+            if (isAdItem(node[i])) {
+                console.debug("[Comfortable YT]", "Removed:", Object.keys(node[i])[0]);
+                node.splice(i, 1);
+            } else cleanJson(node[i]);
         }
+        return;
     }
-}
+    if (!node || typeof node !== "object") return;
 
-// Modify player
-function handlePlayer(playerJson) {
-    const liveBroadcastDetails =
-        playerJson.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
-    if (liveBroadcastDetails && liveBroadcastDetails?.isLiveNow) {
-        isLive = true;
+    if (Array.isArray(node.flexibleItems)) runStep("moveDownloadToActions", () => moveDownloadToActions(node));
+
+    if ("playabilityStatus" in node) {
+        runStep("removeTracking", () => removeTracking(node));
+        runStep("restoreDownload", () => restoreDownload(node));
+        runStep("keepBestAudioFormats", () => keepBestAudioFormats(node));
     }
-    removeAds(playerJson);
-    removeYouThere(playerJson);
-    removeTracking(playerJson);
-    restoreDownload(playerJson);
-}
 
-// endregion
-
-// region Browse JSON
-
-const browseJsonFilterRenderFunc = content => {
-    const deleteRender = !(
-        content.richItemRenderer?.content?.adSlotRenderer ||
-        content.richSectionRenderer?.content?.statementBannerRenderer?.titleFontFamily === "PROMO_FONT_FAMILY_YOUTUBE_SANS_BOLD"
-    );
-    if (!deleteRender) console.debug("Video slot AD removed.");
-    return deleteRender;
-};
-
-// Remove promoion overlay
-function removePromoOverlay(json) {
-    if (json.overlay?.mealbarPromoRenderer) {
-        delete json.overlay.mealbarPromoRenderer;
-        console.debug("Chrome recommendion removed.");
-    }
-}
-
-// Remove home page banner promotion
-function removeHeaderMasterThreadPromo(json) {
-    if (json.contents?.twoColumnBrowseResultsRenderer?.tabs) {
-        const tab = json.contents.twoColumnBrowseResultsRenderer.tabs.find(tab => tab.tabRenderer?.selected && tab.tabRenderer.content?.richGridRenderer)?.tabRenderer?.content;
-        if (tab)
-            tab.richGridRenderer.contents = tab.richGridRenderer.contents.filter(browseJsonFilterRenderFunc);
+    for (const key of Object.keys(node)) {
+        const value = node[key];
         if (
-            tab &&
-            tab.richGridRenderer.masthead &&
-            (
-                tab.richGridRenderer.masthead.bannerPromoRenderer ||
-                tab.richGridRenderer.masthead.adSlotRenderer
-            )
+            AD_KEYS.has(key) ||
+            isAdRendererEntry(key, value) ||
+            (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 1 && hasAdRenderer(value))
         ) {
-            delete tab.richGridRenderer.masthead;
-            console.debug("Removed home page banner promotion.");
-        }
+            console.debug("[Comfortable YT]", "Removed:", key);
+            delete node[key];
+        } else cleanJson(value);
     }
 }
-
-// Remove home page feed promotion (For continue browsing homepage)
-function removeHomePageFeedPrototion(json) {
-    if (json.onResponseReceivedActions) {
-        const actions = json.onResponseReceivedActions.find(action => action.appendContinuationItemsAction);
-        if (actions)
-            actions.appendContinuationItemsAction.continuationItems = actions.appendContinuationItemsAction.continuationItems.filter(browseJsonFilterRenderFunc);
-    }
-}
-
-// Remove sign-in promotion
-function removeSignInPromo(json) {
-    if (json.items)
-        json.items = json.items.filter(item => !item.guideSigninPromoRenderer);
-}
-
-// Remove search result promotion
-function removeSearchResultPromo(json) {
-    if (json.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents) {
-        const contents = json.contents.twoColumnSearchResultsRenderer.primaryContents.sectionListRenderer.contents;
-        for (const content of contents) {
-            if (content.itemSectionRenderer) {
-                content.itemSectionRenderer.contents = content.itemSectionRenderer.contents.filter(content => {
-                    if (content.adSlotRenderer) console.debug("Search result AD removed.");
-                    return !content.adSlotRenderer;
-                });
-            }
-        }
-    }
-}
-
-// Modify browse
-function handleBrowse(browseJson) {
-    removePromoOverlay(browseJson);
-    removeHeaderMasterThreadPromo(browseJson);
-    removeHomePageFeedPrototion(browseJson);
-    removeSignInPromo(browseJson);
-    removeSearchResultPromo(browseJson);
-}
-
-// endregion
-
-function removeNextWatchColAd(json) {
-    if (json.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results) {
-        const results = json.contents.twoColumnWatchNextResults.secondaryResults.secondaryResults.results;
-        for (const result of results) {
-            if (result.adSlotRenderer) {
-                console.debug("Next watch column AD removed.");
-                delete result.adSlotRenderer;
-            }
-        }
-    }
-}
-
-// Modify next
-function handleNext(nextJson) {
-    removeNextWatchColAd(nextJson);
-}
-
-
-// endregion
 
 // region Download
 
 function fetchPlayerSync(url, context, videoId) {
     console.debug("[Comfortable YT]", "Download:", "Fetching video player response");
 
-    const xhr = window.unsafeWindow.XMLHttpRequest();
+    const xhr = new wind.XMLHttpRequest();
     let playerResponseJson;
 
+    fetchingForDownload = true;
     try {
         xhr.open("POST", url, false);
         xhr.withCredentials = true;
         xhr.setRequestHeader("Content-Type", "application/json");
-        xhr.send(JSON.stringify({ context, videoId }));
+        xhr.send(JSON.stringify({
+            context,
+            videoId,
+            playbackContext: { contentPlaybackContext: { signatureTimestamp: wind.ytcfg?.get?.("STS") } }
+        }));
         if (xhr.status !== 200) throw new Error(`Player response status is ${xhr.status}`);
         else if (!xhr.responseText) throw new Error("Player response is empty");
         playerResponseJson = JSON.parse(xhr.responseText);
@@ -258,11 +248,13 @@ function fetchPlayerSync(url, context, videoId) {
         return playerResponseJson;
     } catch (e) {
         console.error("[Comfortable YT]", "Video player download failed:", "Failed to fetch player response:", e);
+    } finally {
+        fetchingForDownload = false;
     }
 }
 
 // Handle offline video
-function handleOfflineVideo(url, requestJson, json) {
+function handleOfflineVideo(url, requestJson) {
     const requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url);
 
     requestUrl.pathname = "/youtubei/v1/player";
@@ -278,22 +270,11 @@ function handleOfflineVideo(url, requestJson, json) {
             offlineVideoData: {
                 videoId: requestJson.videoIds[0],
                 thumbnail: playerResponseJson.videoDetails.thumbnail,
-                // channel: {
-                //   offlineChannelData: {
-                //     channelId: playerResponseJson.videoDetails.channelId,
-                //     thumbnail: playerResponseJson.microformat.playerMicroformatRenderer.thumbnail,
-                //     title: playerResponseJson.videoDetails.author,
-                //     isChannelOwner: playerResponseJson.videoDetails.isOwnerViewing
-                //   }
-                // },
                 title: playerResponseJson.videoDetails.title,
-                // lengthText: "0:00",
-                // publishedTimestamp: "0",
                 viewCount: playerResponseJson.videoDetails.viewCount,
                 shareUrl: `https://youtu.be/${playerResponseJson.videoDetails.videoId}`,
-                description: playerResponseJson.microformat.playerMicroformatRenderer.description,
+                description: playerResponseJson.microformat?.playerMicroformatRenderer?.description,
                 shortViewCountText: numberFormat(playerResponseJson.videoDetails.viewCount),
-                // likesCount: "0",
                 lengthSeconds: playerResponseJson.videoDetails.lengthSeconds
             }
         }]
@@ -302,164 +283,218 @@ function handleOfflineVideo(url, requestJson, json) {
 
 // Handle download action
 function handleDownloadAction(requestJson, json) {
+    if (!json.onResponseReceivedCommand?.openPopupAction?.popup?.offlinePromoRenderer) return;
     const videoId = requestJson["videoId"],
         formatType = requestJson["preferredFormatType"],
-        entityKey = btoa(atob("EgsAAAAAAAAAAAAAACDKASgB").replace("\x00".repeat(11), videoId));
-    if (json.onResponseReceivedCommand.openPopupAction?.popup?.offlinePromoRenderer) {  // Not premium
-        const clickTrackingParams = json.onResponseReceivedCommand.clickTrackingParams;
-        const commandOne = requestJson.preferredFormatType === "UNKNOWN_FORMAT_TYPE" ? {
-            clickTrackingParams,
-            openPopupAction: {
-                popupType: "DIALOG",
-                replacePopup: true,
-                popup: {
-                    downloadQualitySelectorRenderer: {
-                        trackingParams: clickTrackingParams,
-                        downloadQualityPickerEntityKey: entityKey,
-                        premiumIcon: { "iconType": "SAD" },
-                        premiumDescription: { runs: [{ text: "You are not YouTube Premium" }] },
-                        onSubmitEndpoint: {
-                            clickTrackingParams,
-                            offlineVideoEndpoint: {
-                                action: "ACTION_ADD",
-                                videoId,
-                                actionParams: {
-                                    formatType,
-                                    settingsAction: "DOWNLOAD_QUALITY_SETTINGS_ACTION_SAVE"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } : {
-            clickTrackingParams,
-            offlineVideoEndpoint: {
-                videoId,
-                action: "ACTION_ADD",
-                actionParams: {
-                    "formatType": formatType,
-                    "settingsAction": "DOWNLOAD_QUALITY_SETTINGS_ACTION_ALREADY_SAVED"
-                }
-            }
-        };
-        if (requestJson.preferredFormatType === "UNKNOWN_FORMAT_TYPE") {  // Next, frameworkUpdates
-            json.frameworkUpdates = {
-                entityBatchUpdate: {
-                    timestamp: getTime(),
-                    mutations: [{
-                        entityKey,
-                        type: "ENTITY_MUTATION_TYPE_REPLACE",
-                        payload: {
-                            downloadQualityPickerEntity: {
-                                "key": entityKey,
-                                "formats": [
-                                    { "name": "HD (1080p)", "format": "HD_1080" },
-                                    { "name": "HD (720p)", "format": "HD" },
-                                    { "name": "SD (480p)", "format": "SD" },
-                                    { "name": "LD (144p)", "format": "LD" },
-                                    {
-                                        "name": "Use this feature at your risk!",
-                                        "availabilityType": "OFFLINEABILITY_AVAILABILITY_TYPE_PREMIUM_LOCKED",
-                                        "format": "UNKNOWN_FORMAT_TYPE"
-                                    }
-                                ]
-                            }
-                        }
-                    }]
-                }
-            }
-        }
-        json.onResponseReceivedCommand = {
-            clickTrackingParams,
-            commandExecutorCommand: {
-                "commands": [
-                    commandOne,
-                    {
+        entityKey = btoa(atob("EgsAAAAAAAAAAAAAACDKASgB").replace("\x00".repeat(11), videoId)),
+        // Clients send preferredFormatType (for example SD) even if the user never saved a quality setting,
+        // so ask for the quality whenever no setting was saved.
+        askQuality = formatType === "UNKNOWN_FORMAT_TYPE" || !Number(requestJson["lastOfflineQualitySettingsSavedMs"]);
+    const clickTrackingParams = json.onResponseReceivedCommand.clickTrackingParams;
+    const commandOne = askQuality ? {
+        clickTrackingParams,
+        openPopupAction: {
+            popupType: "DIALOG",
+            replacePopup: true,
+            popup: {
+                downloadQualitySelectorRenderer: {
+                    trackingParams: clickTrackingParams,
+                    downloadQualityPickerEntityKey: entityKey,
+                    onSubmitEndpoint: {
                         clickTrackingParams,
-                        signalAction: {
-                            signal: "REQUEST_PERSISTENT_STORAGE"
+                        offlineVideoEndpoint: {
+                            action: "ACTION_ADD",
+                            videoId,
+                            actionParams: {
+                                formatType,
+                                settingsAction: "DOWNLOAD_QUALITY_SETTINGS_ACTION_SAVE"
+                            }
                         }
                     }
-                ]
+                }
             }
         }
-        console.debug("Replaced download action from normal user to Premium.");
+    } : {
+        clickTrackingParams,
+        offlineVideoEndpoint: {
+            videoId,
+            action: "ACTION_ADD",
+            actionParams: {
+                "formatType": formatType,
+                "settingsAction": "DOWNLOAD_QUALITY_SETTINGS_ACTION_ALREADY_SAVED"
+            }
+        }
+    };
+    if (askQuality) {
+        json.frameworkUpdates = {
+            entityBatchUpdate: {
+                timestamp: getTime(),
+                mutations: [{
+                    entityKey,
+                    type: "ENTITY_MUTATION_TYPE_REPLACE",
+                    payload: {
+                        downloadQualityPickerEntity: {
+                            "key": entityKey,
+                            "formats": [
+                                { "name": "HD (1080p)", "format": "HD_1080" },
+                                { "name": "HD (720p)", "format": "HD" },
+                                { "name": "SD (480p)", "format": "SD" },
+                                { "name": "LD (144p)", "format": "LD" }
+                            ]
+                        }
+                    }
+                }]
+            }
+        }
     }
+    json.onResponseReceivedCommand = {
+        clickTrackingParams,
+        commandExecutorCommand: {
+            "commands": [
+                commandOne,
+                {
+                    clickTrackingParams,
+                    signalAction: {
+                        signal: "REQUEST_PERSISTENT_STORAGE"
+                    }
+                }
+            ]
+        }
+    }
+    console.debug("Replaced download action from normal user to Premium.");
 }
 
-// Handle Playback data entity
-function handlePlaybackDataEntity(url, requestJson, json) {
-    function toTransferKey(str) {
-        // Step 1: URL decode
-        const urlDecoded = decodeURIComponent(str);
+const OFFLINE_ENTITY_TYPE = { playbackData: 119, transfer: 120, offlineVideoPolicy: 130, videoDownloadContextEntity: 461 };
+const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
 
-        // Step 2: Base64 decode
-        const base64Decoded = atob(urlDecoded);
+/**
+ * Builds an offline entity key: the URL-encoded base64 of the protobuf { 2: videoId, 4: entity type, 5: 1 }.
+ */
+function offlineEntityKey(videoId, type) {
+    const varint = type < 0x80 ? [type] : [(type & 0x7f) | 0x80, type >> 7];
+    const bytes = [0x12, videoId.length, ...[...videoId].map(c => c.charCodeAt(0)), 0x20, ...varint, 0x28, 0x01];
+    return encodeURIComponent(btoa(String.fromCharCode(...bytes)));
+}
 
-        // Step 3: Convert to byte array
-        const byteArray = new Uint8Array([...base64Decoded].map(c => c.charCodeAt(0)));
+/**
+ * The offline downloader only downloads from each format's url. The web /player response has SABR
+ * formats without urls; only Premium offline responses include them.
+ * VISIONOS urls need no signature decryption and no GVS PO token, and they download fully in the browser (measured).
+ * Send no cookies: a signed-in request returns no formats.
+ */
+async function fetchDirectStreamingData(videoId, client) {
+    const context = {
+        client: {
+            clientName: "VISIONOS",
+            clientVersion: "1.02",
+            deviceMake: "Apple",
+            deviceModel: "RealityDevice17,1",
+            userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+            osName: "visionOS",
+            osVersion: "26.5.23O471",
+            hl: client?.hl,
+            gl: client?.gl,
+            visitorData: client?.visitorData,
+        }
+    };
+    const response = await wind.fetch("/youtubei/v1/player?prettyPrint=false", {
+        method: "POST",
+        credentials: "omit",
+        headers: { "Content-Type": "application/json", "X-YouTube-Client-Name": "101", "X-YouTube-Client-Version": "1.02" },
+        body: JSON.stringify({ context, videoId, contentCheckOk: true, racyCheckOk: true }),
+    });
+    const json = await response.json();
+    const formats = json.streamingData?.adaptiveFormats;
+    if (json.playabilityStatus?.status !== "OK" || !formats?.length || !formats.every(format => format.url))
+        throw new Error(`Direct formats unavailable: ${json.playabilityStatus?.status} ${json.playabilityStatus?.reason || ""}`);
+    return json.streamingData;
+}
 
-        // Step 4: Change the last third byte
-        byteArray[14]++;
+async function handlePlaybackDataEntity(url, requestJson, json) {
+    const video = requestJson["videos"][0],
+        entityKey = video["entityKey"],
+        videoId = atob(decodeURIComponent(entityKey)).substring(2, 13),
+        now = Math.floor(Date.now() / 1000),
+        mutations = json.frameworkUpdates?.entityBatchUpdate?.mutations || [];
+    let policy = mutations.find(mutation => mutation.payload?.offlineVideoPolicy)?.payload.offlineVideoPolicy,
+        playbackData = mutations.find(mutation => mutation.payload?.playbackData)?.payload.playbackData;
 
-        // Step 5: Convert back to string
-        const modifiedString = String.fromCharCode.apply(null, byteArray);
-
-        // Step 6: Base64 encode
-        const base64Encoded = btoa(modifiedString);
-
-        // Step 7: URL encode
-        return encodeURIComponent(base64Encoded);
+    // On refresh (for example after the urls expire), the server deletes the entities of non-Premium accounts.
+    // Return fresh playback data instead, otherwise the download is removed.
+    if (!policy || !playbackData) {
+        if (!video.refreshData) {
+            console.error("[Comfortable YT]", "Download:", "offlineVideoPolicy / playbackData not found in playback data entity");
+            return;
+        }
+        policy = { key: offlineEntityKey(videoId, OFFLINE_ENTITY_TYPE.offlineVideoPolicy), lastUpdatedTimestampSeconds: String(now) };
+        playbackData = {
+            key: entityKey,
+            playerResponseTimestamp: String(now),
+            offlineVideoPolicy: offlineEntityKey(videoId, OFFLINE_ENTITY_TYPE.offlineVideoPolicy),
+            videoDownloadContextEntity: offlineEntityKey(videoId, OFFLINE_ENTITY_TYPE.videoDownloadContextEntity),
+        };
+        json.frameworkUpdates = {
+            entityBatchUpdate: {
+                mutations: [
+                    { entityKey, type: "ENTITY_MUTATION_TYPE_REPLACE", payload: { playbackData }, options: { persistenceOption: "ENTITY_PERSISTENCE_OPTION_PERSIST" } },
+                    { entityKey: policy.key, type: "ENTITY_MUTATION_TYPE_REPLACE", payload: { offlineVideoPolicy: policy }, options: { persistenceOption: "ENTITY_PERSISTENCE_OPTION_PERSIST" } },
+                ],
+                timestamp: { seconds: String(now), nanos: 0 },
+            }
+        };
     }
 
-    const mutations = json.frameworkUpdates.entityBatchUpdate.mutations,
-        entityKey = requestJson["videos"][0]["entityKey"],
-        transferEntityKey = toTransferKey(entityKey),
-        requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url),
-        lastUpdatedTimestampSeconds = Number(mutations[0].payload['offlineVideoPolicy']['lastUpdatedTimestampSeconds']);
-
+    const requestUrl = new URL(url.startsWith("/") ? `https://www.youtube.com${url}` : url);
     requestUrl.pathname = "/youtubei/v1/player";
 
-    // Fetch playerResponseJson
-    const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, atob(decodeURIComponent(entityKey)).substring(2, 13));
+    const playerResponseJson = fetchPlayerSync(requestUrl.toString(), requestJson.context, videoId);
     if (!playerResponseJson) return;
-
-    // Edit offlineVideoPolicy
-    Object.assign(mutations[0].payload['offlineVideoPolicy'], {
-        action: "OFFLINE_VIDEO_POLICY_ACTION_OK",
-        shortMessageForDisabledAction: undefined,
-        expirationTimestamp: lastUpdatedTimestampSeconds + (1 * 60 * 60 * 24 * 365),  // 1 Year
-    });
-
-    if (requestJson["videos"][0]["refreshData"]) {  // Offline video refresh
-        console.debug("Replaced offline video refresh playback data entity.");
+    let streamingData;
+    try {
+        streamingData = await fetchDirectStreamingData(videoId, requestJson.context?.client);
+    } catch (e) {
+        console.error("[Comfortable YT]", "Download:", e);
         return;
     }
 
-    // Edit playbackData
-    Object.assign(mutations[1].payload['playbackData'], {
+    // The server's policy says the download failed because it needs Premium. Allow it, and drop
+    // offlineStateBytes, which holds the same failure state.
+    Object.assign(policy, {
+        action: "OFFLINE_VIDEO_POLICY_ACTION_OK",
+        shortMessageForDisabledAction: undefined,
+        offlineStateBytes: undefined,
+        expirationTimestamp: Number(policy.lastUpdatedTimestampSeconds || now) + ONE_YEAR_SECONDS,
+    });
+
+    const transferEntityKey = offlineEntityKey(videoId, OFFLINE_ENTITY_TYPE.transfer);
+    Object.assign(playbackData, {
         transfer: transferEntityKey,
-        streamDownloadTimestampSeconds: mutations[1].payload['playbackData']['playerResponseTimestamp'],
+        playerResponsePlayabilityCanPlayStatus: "OK",
+        streamDownloadTimestampSeconds: playbackData["playerResponseTimestamp"],
         playerResponseJson: JSON.stringify({
             responseContext: playerResponseJson['responseContext'],
             attestation: playerResponseJson['attestation'],
             microformat: playerResponseJson['microformat'],
             offlineState: {
                 action: "OK",
-                expiresInSeconds: 1 * 60 * 60 * 24 * 365,  // 1 Year
+                expiresInSeconds: ONE_YEAR_SECONDS,
                 isOfflineSharingAllowed: true,
-                refreshInSeconds: 1 * 60 * 60 * 24 * 365,  // 1 Year
+                refreshInSeconds: ONE_YEAR_SECONDS,
             },
             playabilityStatus: playerResponseJson['playabilityStatus'],
             playbackTracking: playerResponseJson['playbackTracking'],
             playerConfig: playerResponseJson['playerConfig'],
             storyboards: playerResponseJson['storyboards'],
-            streamingData: playerResponseJson['streamingData'],
+            streamingData,
             videoDetails: playerResponseJson['videoDetails'],
             trackingParams: playerResponseJson['trackingParams']
         })
     });
+
+    if (video.refreshData) {
+        console.debug("[Comfortable YT]", "Download:", "Replaced offline video refresh playback data entity.");
+        return;
+    }
 
     // Add orchestrationActions
     Object.assign(json, {
@@ -468,37 +503,242 @@ function handlePlaybackDataEntity(url, requestJson, json) {
             actionType: "OFFLINE_ORCHESTRATION_ACTION_TYPE_ADD",
             actionMetadata: {
                 priority: 1,
-                transferEntityActionMetadata: requestJson["videos"][0].downloadParameters?.maximumDownloadQuality ? {
-                    maximumDownloadQuality: requestJson["videos"][0].downloadParameters.maximumDownloadQuality
+                transferEntityActionMetadata: video.downloadParameters?.maximumDownloadQuality ? {
+                    maximumDownloadQuality: video.downloadParameters.maximumDownloadQuality
                 } : undefined
             }
         }]
     });
 
-    console.debug("Replaced playback data entity.");
+    console.debug("[Comfortable YT]", "Download:", "Replaced playback data entity.");
 }
 
 // endregion
 
+function handleApiResponse(pathname, json, getRequest) {
+    switch (pathname) {
+        case "/youtubei/v1/offline": {
+            const { url, body } = getRequest();
+            return handleOfflineVideo(url, body);
+        }
+        case "/youtubei/v1/offline/get_download_action":
+            handleDownloadAction(getRequest().body, json);
+            return json;
+        case "/youtubei/v1/offline/get_playback_data_entity": {
+            const { url, body } = getRequest();
+            return handlePlaybackDataEntity(url, body, json).then(() => json);
+        }
+        default:
+            cleanJson(json);
+            return json;
+    }
+}
+
 (function () {
     "use strict";
 
-    const wind = window.unsafeWindow;
-    let lastAudioUrl;
-    let isLive = false;
+    // Quality switching limits (measured against base.js):
+    // - setPlaybackQualityRange always uses reason "m". Only a locked range (min === max) changes the quality,
+    //   and the SABR loader then rebuilds the media (emptied, then loadstart), cutting playback for about 0.1s.
+    //   An unlocked downgrade range has no effect.
+    // - Unlocking to ("auto", "auto") does not rebuild the media, but the quality only rises after the buffered
+    //   low quality media plays out (buffered seconds / playback rate). Live streams buffer about 20s even at
+    //   the live edge, so turning audio mode off also locks the quality.
+
+    const QUALITY_BACKUP_KEY = "audio-mode-quality-backup";
+    const PLAYER_STATE_PAUSED = 2;
+    const QUALITY_STORAGE_KEY = "yt-player-quality";
+    const FORCE_DOWNGRADE_DELAY_MS = 2 * 60 * 1000;
+    const FADE_MS = 80;
+
+    let switchGeneration = 0;
+    let cancelPendingDowngrade = () => {};
+
+    const getVideo = player => player.querySelector("video");
+
+    /**
+     * Uses timers instead of requestAnimationFrame: rAF stops while the window is covered, which leaves
+     * the volume halfway (measured). Background pages throttle timers to one run every 1s to 1min,
+     * so a hidden page gets the final volume at once.
+     */
+    function fadeVolume(video, to, ms) {
+        if (document.hidden) {
+            video.volume = to;
+            return Promise.resolve();
+        }
+        const from = video.volume, start = performance.now();
+        return new Promise(resolve => {
+            const step = () => {
+                const k = Math.min(1, (performance.now() - start) / ms);
+                video.volume = from + (to - from) * k;
+                if (k < 1) setTimeout(step, 16); else resolve();
+            };
+            step();
+        });
+    }
+
+    function waitResumed(video, timeoutMs) {
+        return new Promise(resolve => {
+            const done = () => { clearTimeout(timer); video.removeEventListener("playing", done); video.removeEventListener("seeked", done); resolve(); };
+            const timer = setTimeout(done, timeoutMs);
+            video.addEventListener("playing", done);
+            video.addEventListener("seeked", done);
+        });
+    }
+
+    function waitEvent(video, name, timeoutMs) {
+        return new Promise(resolve => {
+            const done = () => { clearTimeout(timer); video.removeEventListener(name, done); resolve(); };
+            const timer = setTimeout(done, timeoutMs);
+            video.addEventListener(name, done);
+        });
+    }
+
+    async function lockQuality(player, quality, generation, fade) {
+        const video = getVideo(player);
+        const fading = fade && video && !video.paused;
+        const volume = video?.volume;
+        if (fading) {
+            await fadeVolume(video, 0, FADE_MS);
+            if (generation !== switchGeneration) {
+                video.volume = volume;
+                return false;
+            }
+        }
+        // Only a real pause resets the position to 0. seekTo does not work before playback starts,
+        // after it ends, or while it loads.
+        const paused = player.getPlayerState?.() === PLAYER_STATE_PAUSED;
+        const live = video && player.getVideoData?.()?.isLive;
+        const playing = video && !video.paused;
+        const time = player.getCurrentTime();
+        player.setPlaybackQualityRange(quality, quality);
+        // After a rebuild, a live stream (paused or not) restarts from the start of the current 5s segment,
+        // and an immediate seekTo also snaps to that start. Seeking back after the rebuild's own seeked
+        // event (about 0.1s later) restores the exact position (measured).
+        if (live && (paused || playing)) {
+            await waitEvent(video, "seeked", 1500);
+            player.seekTo(time, true);
+        } else if (paused) {
+            player.seekTo(time, true);
+        }
+        if (fading) {
+            await waitResumed(video, 1500);
+            await fadeVolume(video, volume, FADE_MS * 2);
+        }
+        return true;
+    }
+
+    function writeQualityPreference(qualityOrdinal) {
+        const now = Date.now();
+        wind.localStorage.setItem(QUALITY_STORAGE_KEY, JSON.stringify({
+            data: JSON.stringify({quality: qualityOrdinal, previousQuality: qualityOrdinal}),
+            expiration: now + 31104000 * 1000,
+            creation: now,
+        }));
+    }
+
+    function restoreQualityStorage(storage) {
+        if (storage === null) wind.localStorage.removeItem(QUALITY_STORAGE_KEY);
+        else wind.localStorage.setItem(QUALITY_STORAGE_KEY, storage);
+    }
+
+    function scheduleDowngrade(player, generation) {
+        cancelPendingDowngrade();
+        const video = getVideo(player);
+        if (!video) return;
+        const events = ["pause", "seeking", "waiting"];
+        const cleanup = () => {
+            clearTimeout(timer);
+            events.forEach(name => video.removeEventListener(name, onEvent));
+            cancelPendingDowngrade = () => {};
+        };
+        // Remove the listeners before locking, because the rebuild itself fires seeking and waiting.
+        const trigger = fade => {
+            cleanup();
+            if (generation === switchGeneration && player.getPlaybackQuality?.() !== "tiny") lockQuality(player, "tiny", generation, fade);
+        };
+        // The end of playback also fires pause. Skip it and ads, and wait for the next interruption.
+        const onEvent = () => { if (!video.ended && !player.classList.contains("ad-showing")) trigger(false); };
+        const timer = setTimeout(() => trigger(true), FORCE_DOWNGRADE_DELAY_MS);
+        events.forEach(name => video.addEventListener(name, onEvent));
+        cancelPendingDowngrade = cleanup;
+    }
+
+    function restoreTarget(player, backup) {
+        const levels = (player.getAvailableQualityLevels?.() || []).filter(q => q !== "auto" && q !== "tiny");
+        if (backup.preferred !== "auto" && levels.includes(backup.preferred)) return backup.preferred;
+        if (levels.includes(backup.quality)) return backup.quality;
+        return levels[0];
+    }
+
+    function updateAudioThumbnail(player) {
+        const videoId = player.getVideoData?.()?.video_id;
+        player.style.setProperty("--cyt-audio-thumb", videoId ? `url("https://i.ytimg.com/vi/${videoId}/hqdefault.jpg")` : "none");
+    }
+
+    // Injected on the first applyAudioMode call, because documentElement may be null at document-start.
+    function injectAudioModeStyle() {
+        if (document.getElementById("cyt-audio-mode-style")) return;
+        const style = document.createElement("style");
+        style.id = "cyt-audio-mode-style";
+        style.textContent = `
+            html.cyt-audio-mode #movie_player:not(.ad-showing) .html5-video-container { visibility: hidden; }
+            html.cyt-audio-mode #movie_player { background: var(--cyt-audio-thumb, none) center / contain no-repeat #000; }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    async function applyAudioMode(enabled) {
+        injectAudioModeStyle();
+        const generation = ++switchGeneration;
+        cancelPendingDowngrade();
+        const player = document.getElementById("movie_player");
+        if (enabled || !player?.setPlaybackQualityRange) document.documentElement.classList.toggle("cyt-audio-mode", enabled);
+        if (!player?.setPlaybackQualityRange) return;
+        updateAudioThumbnail(player);
+
+        const backup = GM_getValue(QUALITY_BACKUP_KEY, false);
+        if (enabled) {
+            if (!backup) GM_setValue(QUALITY_BACKUP_KEY, {
+                preferred: player.getPreferredQuality?.() || "auto",
+                quality: player.getPlaybackQuality?.(),
+                storage: wind.localStorage.getItem(QUALITY_STORAGE_KEY),
+            });
+            writeQualityPreference(144);
+            if (player.getPlaybackQuality?.() === "tiny") return;
+            if (getVideo(player)?.paused) lockQuality(player, "tiny", generation, false);
+            else scheduleDowngrade(player, generation);
+            return;
+        }
+
+        if (backup) {
+            const target = restoreTarget(player, backup);
+            if (player.getPlaybackQuality?.() === "tiny") {
+                const done = target ? await lockQuality(player, target, generation, true) : true;
+                if (!done || generation !== switchGeneration) return;
+                if (backup.preferred === "auto" || !target) player.setPlaybackQualityRange("auto", "auto");
+            }
+            // setPlaybackQualityRange writes localStorage, so restore the backup last.
+            restoreQualityStorage(backup.storage);
+            GM_setValue(QUALITY_BACKUP_KEY, false);
+        }
+        if (generation === switchGeneration) document.documentElement.classList.remove("cyt-audio-mode");
+    }
 
     // Add a option to settings panel
     function addSettingOption(text, idName, callback) {
+        const onClick = function () {
+            GM_setValue(idName, !GM_getValue(idName));
+            this.setAttribute("aria-checked", GM_getValue(idName));
+            callback(GM_getValue(idName));
+        };
         const elem = document.getElementById(idName);
         if (elem) {
-            // Already exist, callback is added
-            elem.onclick = function (e) {
-                GM_setValue(idName, !GM_getValue(idName));
-                this.setAttribute("aria-checked", GM_getValue(idName));
-                callback(GM_getValue(idName));
-            };
+            elem.onclick = onClick;
             return;
         }
+        const menu = document.querySelector("#movie_player .ytp-panel-menu");
+        if (!menu) return;
         const divMenuItemElem = document.createElement("div");
         const divIconElem = document.createElement("div");
         const divLabelElem = document.createElement("div");
@@ -507,74 +747,31 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         divIconElem.classList.add("ytp-menuitem-icon");
         divLabelElem.classList.add("ytp-menuitem-label");
         divContentElem.classList.add("ytp-menuitem-content");
-        divContentElem.innerHTML = '<div class="ytp-menuitem-toggle-checkbox">';
+        const checkboxElem = document.createElement("div");
+        checkboxElem.classList.add("ytp-menuitem-toggle-checkbox");
+        divContentElem.appendChild(checkboxElem);
         divLabelElem.innerText = text;
         divMenuItemElem.id = idName;
+        divMenuItemElem.setAttribute("role", "menuitemcheckbox");
         divMenuItemElem.setAttribute("aria-checked", GM_getValue(idName));
-        divMenuItemElem.onclick = function (e) {
-            GM_setValue(idName, !GM_getValue(idName));
-            this.setAttribute("aria-checked", GM_getValue(idName));
-            callback(GM_getValue(idName));
-        };
+        divMenuItemElem.onclick = onClick;
         divMenuItemElem.appendChild(divIconElem);
         divMenuItemElem.appendChild(divLabelElem);
         divMenuItemElem.appendChild(divContentElem);
-        document
-            .getElementsByClassName("ytp-panel-menu")[0]
-            .appendChild(divMenuItemElem);
+        menu.appendChild(divMenuItemElem);
     }
-
-    // Listener to reset var
-    wind.addEventListener("yt-navigate-start", function () {
-        lastAudioUrl = undefined;
-        isLive = false;
-    });
 
     // Listener to load options
     wind.addEventListener("yt-navigate-finish", function () {
-        const video = document.getElementsByTagName("video")[0];
-        if (video) {
-            addSettingOption("Audio Mode", "audio-mode", audioModeCall);
-
-            // Init
-            audioModeCall(GM_getValue("audio-mode"));
-        }
+        if (!document.getElementById("movie_player")) return;
+        addSettingOption("Audio Mode", AUDIO_MODE_KEY, applyAudioMode);
+        applyAudioMode(!!GM_getValue(AUDIO_MODE_KEY));
     });
 
-    // Audio Mode
-    function audioModeCall(enabled) {
-        // console.debug("Audio mode", enabled);
-        if (isLive) {
-            const container = document.getElementsByClassName(
-                "html5-video-container"
-            )[0];
-            container.style.display = enabled ? "none" : "";
-        } else audioReplaceSrcUrl();
-    }
-
-    // Audio Mode - Replace source url
-    function audioReplaceSrcUrl() {
-        const videoElem = document.getElementsByClassName("html5-main-video")[0];
-        const isPuased = videoElem.paused;
-        const currTime = videoElem.currentTime;
-        const enabled = GM_getValue("audio-mode");
-        if (enabled && !lastAudioUrl) videoElem.load();
-        else if (enabled && lastAudioUrl && videoElem.src.startsWith("blob")) {
-            // console.debug("Replaced to audio url");
-            videoElem.src = lastAudioUrl;
-            videoElem.pause();
-            videoElem.currentTime = currTime;
-            if (!isPuased) videoElem.play();
-        } else if (!enabled && lastAudioUrl) {
-            const player = document.getElementsByTagName("ytd-player")[0].getPlayer();
-            // console.debug("Player refreshed");
-            const videoId = player.getVideoData().video_id;
-            player.cueVideoById(videoId);
-            videoElem.pause();
-            videoElem.currentTime = currTime;
-            if (!isPuased) player.playVideo();
-        }
-    }
+    // The player computes idle time as Date.now() - window._lact. Refreshing it stops the idle pause prompt.
+    setInterval(() => {
+        wind._lact = Date.now();
+    }, 60 * 1000);
 
     // Apply network hook
     function applyNetworkHook() {
@@ -630,10 +827,12 @@ function handlePlaybackDataEntity(url, requestJson, json) {
             }
 
             eventHook() {
-                this.mockResponse = handleXMLResponse.call(this.xhr, this, this.requestBody, this.requestArgs);
+                if (this.mockResponse !== null) return;
+                const result = handleXMLResponse.call(this.xhr, this, this.requestBody, this.requestArgs);
+                if (result !== undefined) this.mockResponse = result;
             }
 
-            open(method, url) {
+            open(_method, url) {
                 if (url.startsWith("//")) url = `https:${url}`;
                 else if (!url.startsWith("http")) url = `${location.origin}${url}`;
                 let parsedUrl;
@@ -642,14 +841,12 @@ function handlePlaybackDataEntity(url, requestJson, json) {
                 } catch (e) {
                     return this.xhr.open.apply(this.xhr, arguments);
                 }
-                // console.debug("[Comfortable YT] XMLHttpRequest", method, url);
 
                 this._open.apply(this.xhr, arguments);
                 this.requestArgs = arguments;
-                if (!handleRequest("XML", method, parsedUrl)) {
+                if (!handleRequest(parsedUrl)) {
                     this.blocked = true;
                     this.mockReadyState = 4;
-                    // console.debug("[Comfortable YT] Blocked:", method, url);
                 }
             }
 
@@ -693,139 +890,77 @@ function handlePlaybackDataEntity(url, requestJson, json) {
 
         }
 
-        const fetchHook = async function (request) {
+        const fetchHook = async function (input, init) {
+            let url, request = null;
             try {
-                let url = request.url || request;
-                if (url.startsWith("//")) url = `https:${url}`;
-                else if (!url.startsWith("http")) url = `${location.origin}${url}`;
-                if (!handleRequest("Fetch", request.method || "GET", new URL(url))) return new Response();
-                const clonedRequest = request instanceof Request ? request.clone() : null;
-
-                // console.debug("[Comfortable YT] fetch", url, request);
-                const response = await origFetch.apply(this, arguments);
-                if (["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
-                return await handleFetchResponse(clonedRequest, response);
+                url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+                if (!handleRequest(url)) return new Response();
+                if (url.pathname.startsWith("/youtubei/v1/offline"))
+                    request = input instanceof Request ? input.clone() : new Request(input, init);
             } catch (e) {
-                console.error("[Comfortable YT]", "fetch error:", e);
+                console.error("[Comfortable YT]", "fetch hook error:", e);
             }
+
+            const response = await origFetch.apply(this, arguments);
+            if (!url || ["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
+            return await handleFetchResponse(url, request, response);
         }
 
         wind.XMLHttpRequest = xmlHttpRequestHook;
         wind.fetch = fetchHook;
-        wind.navigator.sendBeacon = (url, data) => true;  // Block analytics data sent to Youtube
+        wind.navigator.sendBeacon = () => true;
         console.info("[Comfortable YT]", "Network hook applied.");
     }
 
-    // Handle request
-    function handleRequest(source, method, url) {
-        if (url.pathname.startsWith("/youtubei/v1/log_event") || url.pathname.startsWith("/log")) return;
-        try {
-            if (GM_getValue("audio-mode")) {
-                // Replace to audio source url
-                if (
-                    (url.searchParams.get("mime") || "").includes("audio") &&
-                    !isLive
-                ) {
-                    url.searchParams.delete("range");
-                    lastAudioUrl = url.toString();
-                    audioReplaceSrcUrl();
-                }
-            }
-        } catch (e) {
-            console.error("[Comfortable YT]", `handle${source}Request`, "Error:", e);
-        }
-        return true;
+    function handleRequest(url) {
+        return !(url.pathname.startsWith("/youtubei/v1/log_event") || url.pathname.startsWith("/log"));
     }
 
     // Handle xml response
     function handleXMLResponse(hook, requestText, requestArgs) {
-        if (this.readyState === 4 && this.responseURL) {
-            try {
-                const url = new URL(this.responseURL);
-                let jsonResp;
-                // console.debug("[Comfortable YT] URL Path: ", url.pathname);
-                switch (url.pathname) {
-                    case "/youtubei/v1/player":
-                        jsonResp = JSON.parse(this.responseText);
-                        handlePlayer(jsonResp);
-                        return JSON.stringify(jsonResp);
-                    case "/youtubei/v1/browse":
-                        jsonResp = JSON.parse(this.responseText);
-                        handleBrowse(jsonResp);
-                        return JSON.stringify(jsonResp);
-                    case "/youtubei/v1/next":
-                        jsonResp = JSON.parse(this.responseText);
-                        handleNext(jsonResp);
-                        return JSON.stringify(jsonResp);
-                    case "/youtubei/v1/offline":
-                        if (this.status !== 401) return;
-                        jsonResp = JSON.parse(this.responseText);
-                        jsonResp = handleOfflineVideo(requestArgs[1], JSON.parse(requestText), jsonResp);
-                        Object.defineProperty(hook, "status", { writable: true });
-                        hook.status = 200;
-                        return JSON.stringify(jsonResp);
-                    case "/youtubei/v1/offline/get_download_action":
-                        jsonResp = JSON.parse(this.responseText);
-                        handleDownloadAction(null, jsonResp);
-                        return JSON.stringify(jsonResp);
-                    case "/youtubei/v1/offline/get_playback_data_entity":
-                        jsonResp = JSON.parse(this.responseText);
-                        handlePlaybackDataEntity(requestArgs[1], JSON.parse(requestText), jsonResp);
-                        return JSON.stringify(jsonResp);
-                    default:
-                        // console.debug(url.pathname);
-                        break;
-                }
-            } catch (e) {
-                console.error("[Comfortable YT]", "handleXMLResponse", `URL(${this.responseURL})`, "Error:", e);
-            }
+        if (this.readyState !== 4 || !this.responseURL) return;
+        try {
+            const url = new URL(this.responseURL);
+            if (!url.pathname.startsWith("/youtubei/v1/")) return;
+            const isOffline = url.pathname === "/youtubei/v1/offline";
+            if (isOffline && this.status !== 401) return;
+            const text = this.responseText;
+            if (!text || !"{[".includes(text.trimStart()[0])) return;
+            const json = handleApiResponse(url.pathname, JSON.parse(text), () => ({
+                url: requestArgs[1],
+                body: JSON.parse(requestText)
+            }));
+            if (json === undefined || json instanceof Promise) return;
+            if (isOffline) hook.mockStatus = 200;
+            return JSON.stringify(json);
+        } catch (e) {
+            console.error("[Comfortable YT]", "handleXMLResponse", `URL(${this.responseURL})`, "Error:", e);
         }
     }
 
-    // Handle fetch response
-    async function handleFetchResponse(req, resp) {
-        try {
-            if (!(resp.headers.get("Content-Type") || "").includes("application/json")) return resp;
-            const url = new URL(resp.url || (req && req.url));
-            if (!url.pathname.startsWith("/youtubei/v1/")) return resp;
+    /** Parses a request body as JSON. YouTube gzips some youtubei request bodies, such as the offline endpoints. */
+    async function readRequestJson(request) {
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        const stream = new Blob([bytes]).stream();
+        const gzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
+        return JSON.parse(await new Response(gzipped ? stream.pipeThrough(new DecompressionStream("gzip")) : stream).text());
+    }
 
-            let jsonResp;
-            switch (url.pathname) {
-                case "/youtubei/v1/player":
-                    jsonResp = await resp.json();
-                    handlePlayer(jsonResp);
-                    resp = createFetchResponse(jsonResp, resp);
-                    break;
-                case "/youtubei/v1/browse":
-                    jsonResp = await resp.json();
-                    handleBrowse(jsonResp);
-                    resp = createFetchResponse(jsonResp, resp);
-                    break;
-                case "/youtubei/v1/next":
-                    jsonResp = await resp.json();
-                    handleNext(jsonResp);
-                    resp = createFetchResponse(jsonResp, resp);
-                    break;
-                case "/youtubei/v1/offline":
-                    if (resp.status === 401) return;
-                    jsonResp = await resp.json();
-                    jsonResp = handleOfflineVideo(req.url, await req.json(), jsonResp);
-                    resp = createFetchResponse(jsonResp, resp, 200);
-                    break;
-                case "/youtubei/v1/offline/get_download_action":
-                    jsonResp = await resp.json();
-                    handleDownloadAction(await req.json(), jsonResp);
-                    resp = createFetchResponse(jsonResp, resp);
-                    break;
-                case "/youtubei/v1/offline/get_playback_data_entity":
-                    jsonResp = await resp.json();
-                    handlePlaybackDataEntity(req.url, await req.json(), jsonResp);
-                    resp = createFetchResponse(jsonResp, resp);
-                    break;
-                default:
-                    // console.debug(url.pathname);
-                    break;
-            }
+    // Handle fetch response
+    async function handleFetchResponse(url, request, resp) {
+        try {
+            if (!url.pathname.startsWith("/youtubei/v1/")) return resp;
+            if (!(resp.headers.get("Content-Type") || "").includes("application/json")) return resp;
+            const isOffline = url.pathname === "/youtubei/v1/offline";
+            if (isOffline && resp.status !== 401) return resp;
+
+            const requestBody = request ? await readRequestJson(request) : null;
+            const json = await handleApiResponse(url.pathname, await resp.clone().json(), () => ({
+                url: request.url,
+                body: requestBody
+            }));
+            if (json === undefined) return resp;
+            return createFetchResponse(json, resp, isOffline ? 200 : undefined);
         } catch (e) {
             console.error("[Comfortable YT]", "handleFetchResponse", `URL(${resp.url})`, "Error:", e);
         }
@@ -845,27 +980,19 @@ function handlePlaybackDataEntity(url, requestJson, json) {
         return response;
     }
 
-    // Hook ytInitialPlayerResponse before page is fully loaded
-    Object.defineProperty(wind, "ytInitialPlayerResponse", {
-        configurable: true,
-        set: function (playerResponse) {
-            delete wind.ytInitialPlayerResponse;
-            handlePlayer(playerResponse);
-            wind.ytInitialPlayerResponse = playerResponse;
-        },
-    });
-
-    // Hook ytInitialData before page is fully loaded
-    Object.defineProperty(wind, "ytInitialData", {
-        configurable: true,
-        set: function (browseJson) {
-            delete wind.ytInitialData;
-            handleBrowse(browseJson);
-            handleNext(browseJson);  // The next video result also visible in Initial Data
-            wind.ytInitialData = browseJson;
-        },
-    });
+    function hookInitialData(name) {
+        Object.defineProperty(wind, name, {
+            configurable: true,
+            set: function (json) {
+                delete wind[name];
+                runStep(`clean ${name}`, () => cleanJson(json));
+                wind[name] = json;
+            },
+        });
+    }
 
     // Init
+    hookInitialData("ytInitialPlayerResponse");
+    hookInitialData("ytInitialData");
     applyNetworkHook();
 })();

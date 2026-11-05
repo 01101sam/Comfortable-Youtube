@@ -27,9 +27,9 @@ For workflow of DMCA Takedown request, please refer to [GitHub DMCA Takedown Pol
 # Features
 - Remove all ads
 - Remove "Are you still there" prompt
-- [ ] Audio mode (Buggy and likely not working right now)
+- Audio mode (hides the video, locks video quality to 144p and keeps only the best audio track, also works on live streams)
 - Remove YouTube tracing
-- [ ] Restore Premium feature of Download for normal user
+- Restore the Premium download feature for non-Premium users (quality picker, download button with progress, offline playback)
 - [ ] UI Panel for settings
     - [ ] Button hiding
     - [ ] Passive comment (A button to load comments)
