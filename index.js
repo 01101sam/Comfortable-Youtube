@@ -8,7 +8,7 @@
 // @downloadURL  https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @updateURL    https://github.com/01101sam/Comfortable-Youtube/raw/master/index.js
 // @author       Sam01101
-// @version      1.5.0
+// @version      1.5.1
 // @icon         https://www.youtube.com/favicon.ico
 // @license      MIT
 // @run-at       document-start
@@ -71,11 +71,13 @@ function getNumberFormatter() {
     });
 }
 
+/** Runs a step, logging instead of throwing. Returns the step's result, or false on error. */
 function runStep(name, step) {
     try {
-        step();
+        return step();
     } catch (e) {
         console.error("[Comfortable YT]", name, "Error:", e);
+        return false;
     }
 }
 
@@ -117,32 +119,39 @@ function isAdItem(item) {
 }
 
 function removeTracking(playerJson) {
-    if (playerJson.playbackTracking) {
-        ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
-            delete playerJson.playbackTracking[urlName];
-        });
-    }
+    const tracking = playerJson.playbackTracking;
+    if (!tracking) return false;
+    let modified = false;
+    ["ptrackingUrl", "atrUrl", "qoeUrl"].forEach(urlName => {
+        if (!(urlName in tracking)) return;
+        delete tracking[urlName];
+        modified = true;
+    });
+    return modified;
 }
 
 function keepBestAudioFormats(playerJson) {
     const formats = playerJson.streamingData?.adaptiveFormats;
-    if (!formats || fetchingForDownload || !GM_getValue(AUDIO_MODE_KEY)) return;
+    if (!formats || fetchingForDownload || !GM_getValue(AUDIO_MODE_KEY)) return false;
     const best = new Map();
     for (const format of formats) {
         if (!format.mimeType?.startsWith("audio/") || format.isDrc || format.audioTrack?.audioIsDefault === false) continue;
         const container = format.mimeType.split(";")[0];
         if (!best.has(container) || best.get(container).bitrate < format.bitrate) best.set(container, format);
     }
-    if (!best.size) return;
+    if (!best.size) return false;
     const kept = new Set(best.values());
-    playerJson.streamingData.adaptiveFormats = formats.filter(format => !format.mimeType?.startsWith("audio/") || kept.has(format));
+    const filtered = formats.filter(format => !format.mimeType?.startsWith("audio/") || kept.has(format));
+    if (filtered.length === formats.length) return false;
+    playerJson.streamingData.adaptiveFormats = filtered;
     console.debug("[Comfortable YT]", "Audio mode: kept audio formats", [...kept].map(format => format.itag).join(", "));
+    return true;
 }
 
 function restoreDownload(playerJson) {
     const payload = playerJson.frameworkUpdates?.entityBatchUpdate?.mutations
         ?.find(mutation => mutation.payload?.offlineabilityEntity)?.payload;
-    if (!payload || payload.offlineabilityEntity.addToOfflineButtonState === "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED") return;
+    if (!payload || payload.offlineabilityEntity.addToOfflineButtonState === "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED") return false;
     const entityKey = payload.offlineabilityEntity.key;
     payload.offlineabilityEntity = {
         addToOfflineButtonState: "ADD_TO_OFFLINE_BUTTON_STATE_ENABLED",
@@ -154,6 +163,7 @@ function restoreDownload(playerJson) {
     if (playerJson.playabilityStatus && !playerJson.playabilityStatus.offlineability)
         playerJson.playabilityStatus.offlineability = { offlineabilityRenderer: { offlineable: true } };
     console.debug("Download feature restored.");
+    return true;
 }
 
 /**
@@ -162,10 +172,10 @@ function restoreDownload(playerJson) {
  * YouTube moves it back into the menu when the bar runs out of space.
  */
 function moveDownloadToActions(menu) {
-    if (!Array.isArray(menu.items) || !Array.isArray(menu.flexibleItems)) return;
-    if (menu.flexibleItems.some(item => item.menuFlexibleItemRenderer?.topLevelButton?.downloadButtonRenderer)) return;
+    if (!Array.isArray(menu.items) || !Array.isArray(menu.flexibleItems)) return false;
+    if (menu.flexibleItems.some(item => item.menuFlexibleItemRenderer?.topLevelButton?.downloadButtonRenderer)) return false;
     const index = menu.items.findIndex(item => item.menuServiceItemDownloadRenderer?.serviceEndpoint?.offlineVideoEndpoint);
-    if (index < 0) return;
+    if (index < 0) return false;
     const [{ menuServiceItemDownloadRenderer: menuItem }] = menu.items.splice(index, 1);
     delete menuItem.subtitleText;
     const endpoint = menuItem.serviceEndpoint;
@@ -185,26 +195,33 @@ function moveDownloadToActions(menu) {
         },
     });
     console.debug("[Comfortable YT]", "Download:", "Moved download button to actions.");
+    return true;
 }
 
+/**
+ * Removes ads and applies the JSON tweaks in place. Returns whether anything changed.
+ * A step that throws midway may change the node without reporting it.
+ */
 function cleanJson(node) {
+    let modified = false;
     if (Array.isArray(node)) {
         for (let i = node.length - 1; i >= 0; i--) {
             if (isAdItem(node[i])) {
                 console.debug("[Comfortable YT]", "Removed:", Object.keys(node[i])[0]);
                 node.splice(i, 1);
-            } else cleanJson(node[i]);
+                modified = true;
+            } else if (cleanJson(node[i])) modified = true;
         }
-        return;
+        return modified;
     }
-    if (!node || typeof node !== "object") return;
+    if (!node || typeof node !== "object") return false;
 
-    if (Array.isArray(node.flexibleItems)) runStep("moveDownloadToActions", () => moveDownloadToActions(node));
+    if (Array.isArray(node.flexibleItems) && runStep("moveDownloadToActions", () => moveDownloadToActions(node))) modified = true;
 
     if ("playabilityStatus" in node) {
-        runStep("removeTracking", () => removeTracking(node));
-        runStep("restoreDownload", () => restoreDownload(node));
-        runStep("keepBestAudioFormats", () => keepBestAudioFormats(node));
+        if (runStep("removeTracking", () => removeTracking(node))) modified = true;
+        if (runStep("restoreDownload", () => restoreDownload(node))) modified = true;
+        if (runStep("keepBestAudioFormats", () => keepBestAudioFormats(node))) modified = true;
     }
 
     for (const key of Object.keys(node)) {
@@ -216,8 +233,10 @@ function cleanJson(node) {
         ) {
             console.debug("[Comfortable YT]", "Removed:", key);
             delete node[key];
-        } else cleanJson(value);
+            modified = true;
+        } else if (cleanJson(value)) modified = true;
     }
+    return modified;
 }
 
 // region Download
@@ -529,8 +548,8 @@ function handleApiResponse(pathname, json, getRequest) {
             return handlePlaybackDataEntity(url, body, json).then(() => json);
         }
         default:
-            cleanJson(json);
-            return json;
+            // undefined keeps the original response untouched
+            return cleanJson(json) ? json : undefined;
     }
 }
 
@@ -773,122 +792,95 @@ function handleApiResponse(pathname, json, getRequest) {
         wind._lact = Date.now();
     }, 60 * 1000);
 
-    // Apply network hook
+    // Wraps only XMLHttpRequest.prototype.open and send, and overrides response getters only on
+    // /youtubei/v1/* and blocked logging requests. Other requests such as /api/timedtext stay native,
+    // so other scripts like kiss-translator can still hook them. See issue #6.
     function applyNetworkHook() {
-        const OldXMLHttpRequest = wind.XMLHttpRequest, origFetch = wind.fetch;
+        const origFetch = wind.fetch;
+        const proto = wind.XMLHttpRequest.prototype;
+        const origOpen = proto.open, origSend = proto.send;
+        /** Per-request state, only for requests this script handles. */
+        const states = new WeakMap();
+        const OVERRIDDEN_KEYS = ["readyState", "status", "response", "responseText"];
 
-        class XMLHttpRequestHook {
-            constructor() {
-                const xhr = new OldXMLHttpRequest();
-
-                // Hook original method
-                this._open = xhr.open.bind(xhr);
-                this._send = xhr.send.bind(xhr);
-                this.xhr = xhr;
-
-                // Args store
-                this.blocked = false;  // Block sending request
-                this.requestBody = null;
-                this.requestArgs = null;
-                this.mockResponse = null;
-                this.mockReadyState = null;
-                this.mockStatus = null;
-
-                // Callback
-                this.callbacks = {};
-            }
-
-            get status() {
-                return this.mockStatus ? this.mockStatus : this.xhr.status;
-            }
-
-            get readyState() {
-                return this.mockReadyState ? this.mockReadyState : this.xhr.readyState;
-            }
-
-            get response() {
-                return this.mockResponse && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.response;
-            }
-
-            get responseText() {
-                return this.mockResponse && this.xhr.readyState === 4 ? this.mockResponse : this.xhr.responseText;
-            }
-
-            addEventListener(event, callback) {
-                if ([
-                    "loadstart",
-                    "progress",
-                    "load",
-                    "loadend",
-                    "readystatechange"
-                ].includes(event))
-                    return this.callbacks[event] = callback;
-                return this.xhr[`on${event}`] = callback;
-            }
-
-            eventHook() {
-                if (this.mockResponse !== null) return;
-                const result = handleXMLResponse.call(this.xhr, this, this.requestBody, this.requestArgs);
-                if (result !== undefined) this.mockResponse = result;
-            }
-
-            open(_method, url) {
-                if (url.startsWith("//")) url = `https:${url}`;
-                else if (!url.startsWith("http")) url = `${location.origin}${url}`;
-                let parsedUrl;
-                try {
-                    parsedUrl = new URL(url);
-                } catch (e) {
-                    return this.xhr.open.apply(this.xhr, arguments);
-                }
-
-                this._open.apply(this.xhr, arguments);
-                this.requestArgs = arguments;
-                if (!handleRequest(parsedUrl)) {
-                    this.blocked = true;
-                    this.mockReadyState = 4;
-                }
-            }
-
-            send(body) {
-                if (this.blocked) {
-                    Object.values(this.callbacks).forEach(callback => callback.call(this.xhr));
-                    return;
-                }
-                if (body) this.requestBody = body;
-                const that = this;
-                Object.entries(this.callbacks).forEach(([event, callback]) => this.xhr[`on${event}`] = function () {
-                    (`${event}Hook` in that ? that[`${event}Hook`] : that.eventHook).call(that);
-                    callback.call(that);
-                });
-                if (!Object.keys(this.callbacks).length) this.xhr.onreadystatechange = this.eventHook.bind(this);
-                this._send.apply(this.xhr, arguments);
+        /** Reads a property from the prototype chain, skipping the instance's own override. */
+        function protoGet(xhr, key) {
+            for (let p = Object.getPrototypeOf(xhr); p; p = Object.getPrototypeOf(p)) {
+                const desc = Object.getOwnPropertyDescriptor(p, key);
+                if (desc) return desc.get ? desc.get.call(xhr) : desc.value;
             }
         }
 
-        const xmlHttpRequestHook = function () {
-            const hook = new XMLHttpRequestHook(), xhr = hook.xhr;
-            return new Proxy(xhr, {
-                get(_, key) {
-                    if (key.startsWith("on") && key.substring(2) in hook.callbacks)
-                        return hook.callbacks[key.substring(2)];
-                    const value = (key in hook ? hook : xhr)[key];
-                    return typeof value === 'function' ? value.bind(key in hook ? hook : xhr) : value;
-                },
-                set(_, key, value) {
-                    if (key.startsWith("on")) {
-                        // Usually event listener
-                        if (typeof value === 'function') {
-                            hook.addEventListener(key.substring(2), value);
-                            return true;
-                        }
-                    }
-                    (key in hook ? hook : xhr)[key] = value;
-                    return true;
-                }
+        const isTextType = xhr => ["", "text"].includes(xhr.responseType);
+
+        /** Lazily computes the modified response once the request is done. */
+        function resolveMock(xhr, state) {
+            if (state.done || protoGet(xhr, "readyState") !== 4) return;
+            state.done = true;
+            const result = handleXMLResponse(xhr, state, protoGet);
+            if (result !== undefined) state.mock = result;
+        }
+
+        function defineOverrides(xhr, state) {
+            const define = (key, get) => Object.defineProperty(xhr, key, { configurable: true, enumerable: false, get });
+            if (state.blocked) {
+                define("readyState", () => state.finished ? 4 : protoGet(xhr, "readyState"));
+                ["response", "responseText"].forEach(key =>
+                    define(key, () => state.finished && isTextType(xhr) ? "" : protoGet(xhr, key)));
+                return;
+            }
+            define("status", () => {
+                resolveMock(xhr, state);
+                return state.mockStatus !== undefined ? state.mockStatus : protoGet(xhr, "status");
             });
-
+            ["response", "responseText"].forEach(key => define(key, () => {
+                resolveMock(xhr, state);
+                return state.mock !== undefined && isTextType(xhr) ? state.mock : protoGet(xhr, key);
+            }));
         }
+
+        proto.open = function (_method, url, async) {
+            if (states.has(this)) {
+                states.delete(this);
+                OVERRIDDEN_KEYS.forEach(key => delete this[key]);
+            }
+            const result = origOpen.apply(this, arguments);
+            try {
+                let fullUrl = String(url);
+                if (fullUrl.startsWith("//")) fullUrl = `https:${fullUrl}`;
+                const parsedUrl = new URL(fullUrl, location.origin);
+                let state = null;
+                if (!handleRequest(parsedUrl))
+                    state = { blocked: true, sync: arguments.length > 2 && !async, finished: false };
+                else if (parsedUrl.pathname.startsWith("/youtubei/v1/"))
+                    state = { blocked: false, url, body: null, done: false, mock: undefined, mockStatus: undefined };
+                if (state) {
+                    states.set(this, state);
+                    defineOverrides(this, state);
+                }
+            } catch (e) {
+                console.error("[Comfortable YT]", "xhr open hook error:", e);
+            }
+            return result;
+        };
+
+        proto.send = function (body) {
+            const state = states.get(this);
+            if (state?.blocked) {
+                // Pretend the request finished without sending it
+                const finish = () => {
+                    if (states.get(this) !== state) return;  // Reopened meanwhile
+                    state.finished = true;
+                    this.dispatchEvent(new Event("readystatechange"));
+                    ["load", "loadend"].forEach(type => this.dispatchEvent(new ProgressEvent(type)));
+                };
+                if (state.sync) finish();
+                else setTimeout(finish);
+                return;
+            }
+            if (state) state.body = body ?? null;
+            return origSend.apply(this, arguments);
+        };
 
         const fetchHook = async function (input, init) {
             let url, request = null;
@@ -902,39 +894,59 @@ function handleApiResponse(pathname, json, getRequest) {
             }
 
             const response = await origFetch.apply(this, arguments);
-            if (!url || ["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
+            if (!url || !url.pathname.startsWith("/youtubei/v1/") || ["error", "opaqueredirect"].includes(response.type) || response.status === 0) return response;
             return await handleFetchResponse(url, request, response);
         }
 
-        wind.XMLHttpRequest = xmlHttpRequestHook;
+        // Blocks beacons to YouTube and Google hosts only
+        const origSendBeacon = wind.navigator.sendBeacon;
+        const sendBeaconHook = function (url) {
+            try {
+                if (isYouTubeOrGoogleHost(new URL(String(url), location.href))) return true;
+            } catch (e) {
+                // Invalid URL: let the native method throw its own error
+            }
+            return origSendBeacon.apply(this, arguments);
+        };
+
         wind.fetch = fetchHook;
-        wind.navigator.sendBeacon = () => true;
+        if (typeof origSendBeacon === "function") wind.navigator.sendBeacon = sendBeaconHook;
         console.info("[Comfortable YT]", "Network hook applied.");
     }
 
-    function handleRequest(url) {
-        return !(url.pathname.startsWith("/youtubei/v1/log_event") || url.pathname.startsWith("/log"));
+    function isYouTubeOrGoogleHost(url) {
+        return /(^|\.)(youtube|google)\.com$/.test(url.hostname);
     }
 
-    // Handle xml response
-    function handleXMLResponse(hook, requestText, requestArgs) {
-        if (this.readyState !== 4 || !this.responseURL) return;
+    /** Returns false for logging requests that should be blocked. */
+    function handleRequest(url) {
+        if (!isYouTubeOrGoogleHost(url)) return true;
+        const path = url.pathname;
+        // "/log" (e.g. play.google.com/log), "/log_*" and "/log/*", but not "/login", "/logout", "/logo*", ...
+        return !(path.startsWith("/youtubei/v1/log_event") || /^\/log(?:$|[_/])/.test(path));
+    }
+
+    // Handle xml response. Reads the underlying values through protoGet, bypassing the instance overrides.
+    function handleXMLResponse(xhr, state, protoGet) {
+        const responseURL = xhr.responseURL;
+        if (!responseURL) return;
         try {
-            const url = new URL(this.responseURL);
+            const url = new URL(responseURL);
             if (!url.pathname.startsWith("/youtubei/v1/")) return;
             const isOffline = url.pathname === "/youtubei/v1/offline";
-            if (isOffline && this.status !== 401) return;
-            const text = this.responseText;
+            if (isOffline && protoGet(xhr, "status") !== 401) return;
+            if (!["", "text"].includes(xhr.responseType)) return;
+            const text = protoGet(xhr, "responseText");
             if (!text || !"{[".includes(text.trimStart()[0])) return;
             const json = handleApiResponse(url.pathname, JSON.parse(text), () => ({
-                url: requestArgs[1],
-                body: JSON.parse(requestText)
+                url: state.url,
+                body: JSON.parse(state.body)
             }));
             if (json === undefined || json instanceof Promise) return;
-            if (isOffline) hook.mockStatus = 200;
+            if (isOffline) state.mockStatus = 200;
             return JSON.stringify(json);
         } catch (e) {
-            console.error("[Comfortable YT]", "handleXMLResponse", `URL(${this.responseURL})`, "Error:", e);
+            console.error("[Comfortable YT]", "handleXMLResponse", `URL(${responseURL})`, "Error:", e);
         }
     }
 
@@ -969,13 +981,30 @@ function handleApiResponse(pathname, json, getRequest) {
 
     // Handle fetch response body
     function createFetchResponse(json, data, customStatus) {
+        const headers = new Headers(data.headers);
+        // The body is re-serialized and no longer encoded, so the original length / encoding do not apply
+        headers.delete("Content-Length");
+        headers.delete("Content-Encoding");
         const response = new Response(JSON.stringify(json), {
             status: customStatus || data.status,
             statusText: data.statusText,
-            headers: data.headers,
+            headers,
         });
-        ["ok", "redirected", "type", "url"].forEach(items => {
-            Object.defineProperty(response, items, { value: data[items] });
+        // "ok" is left native so that it follows the (possibly custom) status
+        return keepResponseMeta(response, { redirected: data.redirected, type: data.type, url: data.url });
+    }
+
+    /** Copies read-only response metadata onto a constructed Response, and onto its clones. */
+    function keepResponseMeta(response, meta) {
+        Object.entries(meta).forEach(([key, value]) => {
+            Object.defineProperty(response, key, { configurable: true, value });
+        });
+        Object.defineProperty(response, "clone", {
+            configurable: true,
+            writable: true,
+            value: function () {
+                return keepResponseMeta(Response.prototype.clone.call(this), meta);
+            },
         });
         return response;
     }
